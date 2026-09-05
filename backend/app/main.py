@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # a test set DB_PATH before the app starts and have it actually take.
     state = AppState(Config.from_env())
     _bootstrap_roster(state)
+    state.simulation.on_movement = state.hub.note_movement
     state.hub.configure(asyncio.get_running_loop(), state.store, state.simulation)
     app.state.app_state = state
     yield
@@ -473,6 +474,7 @@ def demo_reset() -> dict[str, str]:
     # a production system would track and cancel those handles explicitly.
     state.simulation = Simulation(state.clock, state.store, state.config)
     _bootstrap_roster(state)
+    state.simulation.on_movement = state.hub.note_movement
     state.hub.rebind_source(state.simulation)
     # Memoized against store.revision, which clear() bumps — but drop it
     # anyway rather than relying on that coupling from another module.

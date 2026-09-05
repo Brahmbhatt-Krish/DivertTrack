@@ -107,6 +107,17 @@ class Ambulance:
         worst_case_ms = worst_case_redirect_ms + worst_case_retry_abort_ms
         self._ticks_per_leg = max(1, round(2 * worst_case_ms / config.tick_ms))
 
+    @property
+    def remaining_km(self) -> Optional[float]:
+        """Distance still to cover on the current leg, or None when this
+        ambulance isn't using position-based movement (the plain demo) or has
+        nowhere to be."""
+        return self._remaining_km
+
+    @property
+    def has_arrived(self) -> bool:
+        return self._arrived
+
     def set_manual_confirm(self, enabled: bool) -> None:
         """Runtime toggle for the demo's manual-mode control (Phase 9),
         mirroring Facility.set_manual_ready — this ambulance is constructed
@@ -259,7 +270,13 @@ class Ambulance:
             self.position = (self.position[0] + dx / distance * step_km, self.position[1] + dy / distance * step_km)
             self._remaining_km = distance - step_km
         initial = self._initial_distance_km or 1.0
-        self.progress = 1.0 if self._remaining_km <= 0.1 else min(1.0, 1.0 - self._remaining_km / initial)
+        by_distance = 1.0 if self._remaining_km <= 0.1 else min(1.0, 1.0 - self._remaining_km / initial)
+        # Arrival waits on min_travel_ms as well as on distance, so progress
+        # has to account for both or the bar sits at 100% for the remainder of
+        # the floor while the ambulance is still shown as en route. Whichever
+        # of the two is further from done is the honest number.
+        by_time = 1.0 if self._min_leg_ticks <= 0 else min(1.0, self._leg_ticks / self._min_leg_ticks)
+        self.progress = min(by_distance, by_time)
         if self._on_position_changed is not None:
             self._on_position_changed(self.transport_id, self.position)
 

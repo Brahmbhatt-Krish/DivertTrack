@@ -274,6 +274,22 @@ acceptance against today's roster would turn every decision a
 decommissioned hospital ever made into a phantom violation, and every bed it
 held into a phantom overbooking.
 
+## The ambulance view
+
+The map shows *where* each ambulance is; the Ambulances panel shows what its
+crew has been **told**. Those are different facts, and the difference is the
+protocol: `known_destination` is the hospital the ambulance was last given by
+a `REDIRECT_NOTICE`, while `current_destination` is the one the dispatcher has
+actually committed to. They diverge for exactly the length of a handoff, and
+a row where they disagree is flagged `redirect in flight` — that is the
+moment the whole system exists to make safe, made visible.
+
+Movement appends no event (an ambulance moving is not a fact about the
+handoff), so the hub is told about it through a separate, cheap hook:
+`note_movement` refreshes only that ambulance's live view and deliberately
+does *not* enter `_dirty_transports`, which would trigger a replay, a
+projection and an invariant check per transport on every movement tick.
+
 ## What the fuzzing actually found
 
 These are defects the property-based tests and adversarial probes surfaced

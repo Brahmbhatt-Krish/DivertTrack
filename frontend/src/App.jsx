@@ -15,6 +15,7 @@ import HospitalsPanel from "./components/HospitalsPanel.jsx";
 import TransportsTable from "./components/TransportsTable.jsx";
 import RegionMap from "./components/RegionMap.jsx";
 import AlertsPanel from "./components/AlertsPanel.jsx";
+import AmbulanceFleet from "./components/AmbulanceFleet.jsx";
 import MultiHospitalControls from "./components/MultiHospitalControls.jsx";
 import GlobalInvariantBadge from "./components/GlobalInvariantBadge.jsx";
 
@@ -116,10 +117,12 @@ export default function App() {
           <MultiHospitalControls onChanged={bumpRefresh} />
           <HospitalsPanel hospitals={state.hospitals} />
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
             <RegionMap hospitals={state.hospitals} ambulances={state.ambulances} />
-            <AlertsPanel alerts={state.alerts} />
+            <AmbulanceFleet ambulances={state.ambulances} transportRows={state.transportRows} />
           </div>
+
+          <AlertsPanel alerts={state.alerts} />
 
           <TransportsTable rows={state.transportRows} />
         </section>

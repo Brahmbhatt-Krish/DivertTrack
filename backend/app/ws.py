@@ -68,6 +68,7 @@ class Hub:
         self._dirty_hospitals: set[str] = set()
         self._pending_alerts: list[dict] = []
         self._roster_dirty = False
+        self._moving: set[str] = set()
         self._flush_scheduled = False
 
     def configure(self, loop: asyncio.AbstractEventLoop, store: EventStore, source: HubSource) -> None:
@@ -132,6 +133,15 @@ class Hub:
             )
         self._schedule_flush()
 
+    def note_movement(self, transport_id: str) -> None:
+        """An ambulance changed position. Deliberately kept out of
+        _dirty_transports: that set triggers a replay + project + check per
+        transport, which is far too expensive to run on every movement tick
+        for every ambulance. This only refreshes the ambulance's own live
+        view, which needs no derivation from the log at all."""
+        self._moving.add(transport_id)
+        self._schedule_flush()
+
     def _schedule_flush(self) -> None:
         if self._flush_scheduled or self._loop is None or self._loop.is_closed():
             return
@@ -153,7 +163,7 @@ class Hub:
             self._flush_scheduled = False
             # An event that landed while the flush above was running would
             # otherwise sit until the next one came along.
-            if self._pending_events or self._pending_alerts:
+            if self._pending_events or self._pending_alerts or self._moving:
                 self._schedule_flush()
 
     def _flush(self) -> None:
@@ -162,7 +172,8 @@ class Hub:
         hospitals, self._dirty_hospitals = self._dirty_hospitals, set()
         alerts, self._pending_alerts = self._pending_alerts, []
         roster_dirty, self._roster_dirty = self._roster_dirty, False
-        if not events and not alerts:
+        moving, self._moving = self._moving, set()
+        if not events and not alerts and not moving:
             return
         if not self._connections:
             return  # nobody listening: skip the replay/project/check entirely
@@ -204,6 +215,14 @@ class Hub:
                 hospital_view = self._source.hospital_view(hospital_id)
                 if hospital_view is not None:
                     messages.append({"kind": "hospital", "hospital_id": hospital_id, "view": hospital_view})
+
+        # Movement for transports that had no event this window — a cheap
+        # position/progress refresh with none of the projection work above.
+        if self._source is not None:
+            for transport_id in moving - transports:
+                ambulance = self._source.ambulance_view(transport_id)
+                if ambulance is not None:
+                    messages.append({"kind": "ambulance", "transport_id": transport_id, **ambulance})
 
         messages.extend(alerts)
         self.broadcast({"kind": "batch", "messages": messages})

@@ -77,13 +77,12 @@ export function reduce(state, message) {
         ...state,
         ambulances: {
           ...state.ambulances,
-          [message.transport_id]: {
-            known_destination: message.known_destination,
-            progress: message.progress,
-            // Carried here so RegionMap can draw live positions from the
-            // shared state instead of polling GET /transports every 2s.
-            position: message.position ?? null,
-          },
+          // Everything the view carries, not a hand-picked subset: the
+          // fields were listed individually and each new one (position, then
+          // arrived/remaining_km) had to be remembered here too — the last
+          // omission left arrived ambulances rendering as still en route.
+          // `kind` and `transport_id` are the envelope, not the view.
+          [message.transport_id]: (({ kind, transport_id, ...view }) => view)(message),
         },
       };
 

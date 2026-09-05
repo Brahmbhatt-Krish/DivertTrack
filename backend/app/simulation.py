@@ -7,7 +7,7 @@ actually happens.
 from __future__ import annotations
 
 import random
-from typing import NamedTuple, Optional, Sequence
+from typing import Callable, NamedTuple, Optional, Sequence
 
 from app.ambulance import Ambulance
 from app.bus import Bus
@@ -78,6 +78,9 @@ class Simulation:
         # How many times each multi-preset has been run, so repeat clicks
         # get fresh transport ids instead of colliding (see run_multi_preset).
         self._preset_runs: dict[str, int] = {}
+        # Set by main.py to the hub's movement hook; None everywhere else
+        # (tests and the fuzz engine have nobody watching).
+        self.on_movement: Optional[Callable[[str], None]] = None
 
     # -- read-only access for callers that need it (tests, main.py) --------
 
@@ -119,7 +122,7 @@ class Simulation:
         ambulance = Ambulance(
             transport_id, self._clock, self._store, self._bus, self._config,
             hospitals=self._hospitals, position=position, on_arrived=self._dispatcher.on_arrived,
-            on_position_changed=self._dispatcher.update_position,
+            on_position_changed=self._on_position_changed,
         )
         self._ambulances[transport_id] = ambulance
         self._bus.register_endpoint(transport_id, ambulance.receive_command)
@@ -364,10 +367,25 @@ class Simulation:
         if ambulance is None:
             return None
         return {
+            # What the *crew* believes, which is not always what the
+            # dispatcher has committed to: the two diverge for exactly the
+            # length of a handoff, which is the whole point of the protocol.
             "known_destination": ambulance.known_destination,
             "progress": ambulance.progress,
             "position": ambulance.position,
+            "remaining_km": ambulance.remaining_km,
+            "arrived": ambulance.has_arrived,
         }
+
+    def _on_position_changed(self, transport_id: str, position: tuple[float, float]) -> None:
+        """An ambulance moved. The dispatcher needs it (ETA is scored from the
+        *current* position, not the origin), and so does anything watching —
+        movement appends no event, so without this hook the hub only learns a
+        transport has moved when some unrelated protocol event happens to fire
+        for it, and the map and progress bars sit frozen in between."""
+        self._dispatcher.update_position(transport_id, position)
+        if self.on_movement is not None:
+            self.on_movement(transport_id)
 
     def _stand_down_ambulance(self, transport_id: str, through_seq: int = 0) -> None:
         """Dispatcher -> ambulance direction of the wiring in
