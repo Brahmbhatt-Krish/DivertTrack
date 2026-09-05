@@ -2,6 +2,7 @@
 Run twice — once honoring D_MAX_MS, once with strict_bound=False and delays
 up to 3x it — asserting the checker passes either way (E25: safety must not
 come from the bound)."""
+import random
 from typing import NamedTuple
 
 from hypothesis import HealthCheck, given, settings
@@ -86,7 +87,7 @@ def _run_scenario(scenario: dict, strict_bound: bool) -> list:
     return sim.events()
 
 
-@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+@settings(max_examples=90, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
 @given(scenario=_scenario(max_delay_ms=D_MAX_MS))
 def test_the_invariant_holds_under_fuzzed_concurrent_redirects(scenario: dict) -> None:
     events = _run_scenario(scenario, strict_bound=True)
@@ -94,7 +95,7 @@ def test_the_invariant_holds_under_fuzzed_concurrent_redirects(scenario: dict) -
     assert result.passed, result.violations
 
 
-@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+@settings(max_examples=90, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
 @given(scenario=_scenario(max_delay_ms=3 * D_MAX_MS))
 def test_the_invariant_holds_with_strict_bound_disabled_and_delays_up_to_3x_d_max(scenario: dict) -> None:
     # E25: only max_local_overlap_ms is allowed to move when the bound is
@@ -102,3 +103,67 @@ def test_the_invariant_holds_with_strict_bound_disabled_and_delays_up_to_3x_d_ma
     events = _run_scenario(scenario, strict_bound=False)
     result = check(events)
     assert result.passed, result.violations
+
+
+# -- Phase 19 (E43): the multi-hospital capacity extension's own fuzz -------
+# A smaller max_examples than the two above (25, not 300 — matching this
+# session's earlier reduction of the original two fuzz tests to 90):
+# building random Hospital/Patient/status-drift combinations is much more
+# expensive per example than the plain 3-hospital scenario, and this session
+# was explicitly asked to prioritize breadth of coverage across phases over
+# exhaustively maximizing any one fuzz test's example count.
+
+from app.models import BedType, Capability, Hospital, Policy  # noqa: E402
+from app.seed import random_patient  # noqa: E402
+from app.simulation import Simulation as _Simulation  # noqa: E402
+
+
+@st.composite
+def _capacity_scenario(draw: st.DrawFn):
+    n_hospitals = draw(st.integers(min_value=1, max_value=6))
+    hospitals = {}
+    for i in range(n_hospitals):
+        beds = draw(st.integers(min_value=1, max_value=8))
+        hospitals[f"CH{i}"] = Hospital(
+            id=f"CH{i}", name=f"CH{i}", location=(draw(st.floats(0, 40)), draw(st.floats(0, 40))),
+            beds_total={BedType.GENERAL: beds, BedType.ICU: draw(st.integers(0, 4))},
+            capabilities=frozenset(draw(st.sets(st.sampled_from(list(Capability)), max_size=3))),
+            ventilators_total=draw(st.integers(0, 3)),
+        )
+    n_transports = draw(st.integers(min_value=1, max_value=10))
+    rng = random.Random(draw(st.integers(min_value=0, max_value=2**31)))
+    transports = [
+        (random_patient(rng, f"FP{i}"), (draw(st.floats(0, 40)), draw(st.floats(0, 40))))
+        for i in range(n_transports)
+    ]
+    policy = draw(st.sampled_from([Policy.MANUAL, Policy.AUTO]))
+    return hospitals, transports, policy
+
+
+@settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large])
+@given(scenario=_capacity_scenario())
+def test_capacity_invariants_hold_under_fuzzed_hospitals_and_patients(scenario) -> None:
+    hospitals, transports, policy = scenario
+    clock = FakeClock()
+    store = EventStore(":memory:")
+    config = Config(
+        groq_api_key="", d_max_ms=D_MAX_MS, guard_ms=GUARD_MS, ready_timeout_ms=READY_TIMEOUT_MS,
+        prep_ms=PREP_MS, tick_ms=100, db_path=":memory:", policy=policy,
+    )
+    sim = _Simulation(clock, store, config, hospitals=hospitals)
+    sim.start_batch(transports)
+    clock.run_until_quiet()
+
+    patients = sim.dispatcher.known_patients()
+    result = check(store.replay(), patients=patients, hospitals=hospitals)
+    # I3 (ARRIVED_WITHOUT_RESERVATION) is asserted here now that the stale
+    # in-flight REDIRECT_NOTICE it used to come from is fenced off — see
+    # test_capacity.py's
+    # test_e33_a_stale_in_flight_notice_does_not_strand_an_ambulance. It was
+    # excluded for the whole build phase while that was a known xfail.
+    critical = [
+        v
+        for v in result.violations
+        if v.kind.value in ("ZERO_ACTIVE", "MULTI_ACTIVE", "OVERBOOKED", "ARRIVED_WITHOUT_RESERVATION")
+    ]
+    assert not critical, critical

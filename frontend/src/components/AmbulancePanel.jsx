@@ -1,28 +1,39 @@
 // Progress, known destination, and a Confirm button (for manual_confirm).
+import { Ambulance } from "lucide-react";
 import { api } from "../api.js";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function AmbulancePanel({ ambulanceView, transportId }) {
   const progress = ambulanceView?.progress ?? 0;
   const knownDestination = ambulanceView?.known_destination ?? "—";
+  const pct = Math.round(progress * 100);
 
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4">
-      <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-slate-900">Ambulance {transportId}</h3>
-        <button
-          className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
-          onClick={() => api.confirm(transportId)}
-        >
-          Confirm
-        </button>
-      </div>
-      <p className="mt-1 text-xs text-slate-500">Known destination: {knownDestination}</p>
-      <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100">
-        <div
-          className="h-2 rounded-full bg-sky-500 transition-all"
-          style={{ width: `${Math.round(progress * 100)}%` }}
-        />
-      </div>
-    </div>
+    <Card className="gap-0 py-4">
+      <CardHeader className="px-4 pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Ambulance className="size-4 text-muted-foreground" />
+            <span className="font-mono">{transportId}</span>
+          </CardTitle>
+          <Button variant="outline" size="sm" onClick={() => api.confirm(transportId)}>
+            Confirm
+          </Button>
+        </div>
+      </CardHeader>
+
+      <CardContent className="px-4">
+        <div className="flex items-baseline justify-between text-xs">
+          <span className="text-muted-foreground">
+            Known destination <span className="font-mono text-foreground">{knownDestination}</span>
+          </span>
+          <span className="font-mono text-muted-foreground">{pct}%</span>
+        </div>
+        <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-muted">
+          <div className="h-2 rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
+        </div>
+      </CardContent>
+    </Card>
   );
 }

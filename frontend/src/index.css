@@ -1,1 +1,72 @@
 @import "tailwindcss";
+
+/* shadcn/ui's semantic token set (neutral base), light only.
+ *
+ * There is deliberately no `.dark` block: this app ships one theme, a
+ * white one. The accent is shadcn's default near-black rather than a
+ * colour — colour is reserved for state that actually means something
+ * (success / warning / destructive), so a red badge on this page always
+ * signals a real problem instead of decoration.
+ *
+ * Tailwind v4 reads these straight out of `@theme`, which is what makes
+ * `bg-primary`, `text-muted-foreground`, `border-border` etc. resolve
+ * inside the generated components under src/components/ui. */
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #0a0a0a;
+
+  --color-card: #ffffff;
+  --color-card-foreground: #0a0a0a;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #0a0a0a;
+
+  --color-primary: #171717;
+  --color-primary-foreground: #fafafa;
+  --color-secondary: #f5f5f5;
+  --color-secondary-foreground: #171717;
+
+  --color-muted: #f5f5f5;
+  --color-muted-foreground: #737373;
+  --color-accent: #f5f5f5;
+  --color-accent-foreground: #171717;
+
+  --color-destructive: #e7000b;
+  --color-destructive-foreground: #fafafa;
+
+  --color-border: #e5e5e5;
+  --color-input: #e5e5e5;
+  --color-ring: #a1a1a1;
+
+  /* Page chrome + status colours used by this app's own components. */
+  --color-canvas: #fafafa;
+  --color-success: #15803d;
+  --color-success-soft: #f0fdf4;
+  --color-success-border: #bbf7d0;
+  --color-warning: #b45309;
+  --color-warning-soft: #fffbeb;
+  --color-warning-border: #fde68a;
+  --color-danger: #b91c1c;
+  --color-danger-soft: #fef2f2;
+  --color-danger-border: #fecaca;
+
+  --radius: 0.625rem;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-foreground);
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  /* Numeric columns (timestamps, bed counts, epochs) line up. */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+}

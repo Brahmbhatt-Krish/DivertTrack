@@ -1,7 +1,13 @@
 // Start, redirect, the seven presets (CHAOS styled as the "chaos toggle"),
 // Reset, in-flight Hold/Release, and manual-mode Confirm buttons.
 import { useState } from "react";
+import { AlertTriangle, Pause, Play, RotateCcw } from "lucide-react";
 import { api } from "../api.js";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 
 const FACILITIES = ["Hospital_A", "Hospital_B", "Hospital_C"];
 const PRESETS = [
@@ -17,6 +23,11 @@ const PRESETS = [
 export default function Controls({ transportId, inFlight, manualMode, onManualModeChange }) {
   const [redirectTarget, setRedirectTarget] = useState(FACILITIES[1]);
   const [error, setError] = useState(null);
+  // A preset only loads a delay table onto the bus — it does nothing
+  // visible by itself. Without some confirmation here, clicking one looks
+  // like a no-op until you separately Start/Redirect, which reads as "the
+  // presets don't work". Track which one is active and say so explicitly.
+  const [activePreset, setActivePreset] = useState(null);
 
   function run(action) {
     return async (...args) => {
@@ -31,113 +42,153 @@ export default function Controls({ transportId, inFlight, manualMode, onManualMo
 
   const handleStart = run(() => api.startTransport(transportId, FACILITIES[0], manualMode));
   const handleRedirect = run(() => api.redirect(transportId, redirectTarget));
-  const handlePreset = run((name) => api.runPreset(name));
-  const handleReset = run(() => api.reset());
+  const handlePreset = run(async (name) => {
+    await api.runPreset(name);
+    setActivePreset(name);
+  });
+  const handleReset = run(async () => {
+    await api.reset();
+    setActivePreset(null);
+  });
   const handleHold = run((commandId) => api.hold(commandId));
   const handleRelease = run((commandId) => api.release(commandId));
   const handleConfirm = run((endpointId) => api.confirm(endpointId));
 
   return (
-    <div className="space-y-4 rounded-lg border border-slate-200 bg-white p-4">
-      {error && <p className="rounded bg-red-50 px-2 py-1 text-xs text-red-700">{error}</p>}
+    <Card className="gap-0 py-4">
+      <CardHeader className="px-4 pb-3">
+        <CardTitle className="text-sm">Controls</CardTitle>
+      </CardHeader>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700"
-          onClick={handleStart}
-        >
-          Start
-        </button>
-        <select
-          className="rounded border border-slate-300 px-2 py-1 text-sm"
-          value={redirectTarget}
-          onChange={(e) => setRedirectTarget(e.target.value)}
-        >
-          {FACILITIES.map((f) => (
-            <option key={f} value={f}>
-              {f}
-            </option>
-          ))}
-        </select>
-        <button
-          className="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-          onClick={handleRedirect}
-        >
-          Redirect
-        </button>
-        <button
-          className="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-          onClick={handleReset}
-        >
-          Reset
-        </button>
-        <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-600">
-          <input
-            type="checkbox"
-            checked={manualMode}
-            onChange={(e) => onManualModeChange(e.target.checked)}
-          />
-          Manual mode
-        </label>
-      </div>
+      <CardContent className="space-y-4 px-4">
+        {error && (
+          <p className="rounded-md border border-danger-border bg-danger-soft px-3 py-2 text-xs text-danger">{error}</p>
+        )}
 
-      <div>
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Presets</h4>
-        <div className="mt-1 flex flex-wrap gap-2">
-          {PRESETS.map((name) => (
-            <button
-              key={name}
-              onClick={() => handlePreset(name)}
-              className={
-                name === "CHAOS"
-                  ? "rounded border border-red-300 bg-red-50 px-2 py-1 text-xs font-semibold text-red-700"
-                  : "rounded border border-slate-300 px-2 py-1 text-xs text-slate-700"
-              }
-            >
-              {name}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={handleStart}>
+            <Play className="size-3.5" />
+            Start
+          </Button>
+
+          <Select value={redirectTarget} onValueChange={setRedirectTarget}>
+            <SelectTrigger size="sm" className="w-[150px] font-mono text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {FACILITIES.map((facility) => (
+                <SelectItem key={facility} value={facility} className="font-mono text-xs">
+                  {facility}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Button variant="outline" size="sm" onClick={handleRedirect}>
+            Redirect
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleReset}>
+            <RotateCcw className="size-3.5" />
+            Reset
+          </Button>
+
+          <label className="ml-auto flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={manualMode}
+              onChange={(e) => onManualModeChange(e.target.checked)}
+              className="size-3.5 accent-primary"
+            />
+            Manual mode
+          </label>
         </div>
-      </div>
 
-      <div>
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">In-flight</h4>
-        <ul className="mt-1 space-y-1 text-xs">
-          {inFlight.length === 0 && <li className="text-slate-400">none</li>}
-          {inFlight.map((message) => (
-            <li key={message.command_id} className="flex items-center justify-between gap-2">
-              <span className="truncate">
-                {message.command_id} · {message.label}
-                {message.held ? " (held)" : ""}
-              </span>
-              {message.held ? (
-                <button className="text-emerald-600 hover:underline" onClick={() => handleRelease(message.command_id)}>
-                  Release
-                </button>
-              ) : (
-                <button className="text-amber-600 hover:underline" onClick={() => handleHold(message.command_id)}>
-                  Hold
-                </button>
-              )}
-            </li>
-          ))}
-        </ul>
-      </div>
+        <Separator />
 
-      <div>
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Confirm (manual mode)</h4>
-        <div className="mt-1 flex flex-wrap gap-2">
-          {[...FACILITIES, transportId].map((endpointId) => (
-            <button
-              key={endpointId}
-              className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700"
-              onClick={() => handleConfirm(endpointId)}
-            >
-              {endpointId}
-            </button>
-          ))}
+        <div>
+          <h4 className="text-xs font-medium text-muted-foreground">Network presets</h4>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {PRESETS.map((name) => {
+              const isActive = activePreset === name;
+              const isChaos = name === "CHAOS";
+              return (
+                <Button
+                  key={name}
+                  size="xs"
+                  variant={isActive ? "default" : "outline"}
+                  onClick={() => handlePreset(name)}
+                  className={cn(
+                    "font-mono",
+                    isChaos && !isActive && "border-danger-border text-danger hover:bg-danger-soft",
+                  )}
+                >
+                  {isChaos && <AlertTriangle className="size-3" />}
+                  {name}
+                </Button>
+              );
+            })}
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {activePreset ? (
+              <>
+                Loaded <span className="font-medium text-foreground">{activePreset}</span> — it only takes effect on the{" "}
+                <em>next</em> Start/Redirect (a preset just changes network delays, it doesn't do anything by itself).
+              </>
+            ) : (
+              "No preset loaded — network delays are random until you pick one."
+            )}
+          </p>
         </div>
-      </div>
-    </div>
+
+        <Separator />
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div>
+            <h4 className="text-xs font-medium text-muted-foreground">In-flight messages</h4>
+            <ul className="mt-2 space-y-1">
+              {inFlight.length === 0 && <li className="text-xs text-muted-foreground/70">none</li>}
+              {inFlight.map((message) => (
+                <li
+                  key={message.command_id}
+                  className="flex items-center justify-between gap-2 rounded-md border border-border px-2 py-1 text-xs"
+                >
+                  <span className="truncate font-mono">
+                    {message.command_id} · {message.label}
+                  </span>
+                  {message.held ? (
+                    <Button size="xs" variant="secondary" onClick={() => handleRelease(message.command_id)}>
+                      <Play className="size-3" />
+                      Release
+                    </Button>
+                  ) : (
+                    <Button size="xs" variant="ghost" onClick={() => handleHold(message.command_id)}>
+                      <Pause className="size-3" />
+                      Hold
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div>
+            <h4 className="text-xs font-medium text-muted-foreground">Confirm (manual mode)</h4>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {[...FACILITIES, transportId].map((endpointId) => (
+                <Button
+                  key={endpointId}
+                  size="xs"
+                  variant="outline"
+                  className="font-mono"
+                  onClick={() => handleConfirm(endpointId)}
+                >
+                  {endpointId}
+                </Button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }

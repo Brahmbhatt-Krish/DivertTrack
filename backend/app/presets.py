@@ -18,7 +18,10 @@ the live call order turns out to differ.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
+
+from app.models import AgeGroup, BedType, ConditionCategory, Patient, Policy
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,115 @@ CHAOS = Preset(
         PresetRedirect(target_facility="Hospital_C", at_ms=1800),
     ),
 )
+
+# -- Phase 17: multi-hospital presets ---------------------------------------
+# Each is a scripted scenario (patients + positions, plus timed hospital
+# status/bed drops) run against the six-hospital seed via
+# Simulation.run_multi_preset() — distinct from the plain Preset above
+# (delay tables for the single AMB-101 demo transport), which these leave
+# entirely unchanged.
+
+
+@dataclass(frozen=True)
+class MultiPresetTransport:
+    patient: Patient
+    position: tuple[float, float]
+    target: Optional[str] = None  # explicit target, for a manual-policy scenario like LAST_BED_RACE
+
+
+@dataclass(frozen=True)
+class StatusOverride:
+    at_ms: int
+    hospital_id: str
+    changes: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BedOverride:
+    at_ms: int
+    hospital_id: str
+    bed_type: BedType
+    total: int
+
+
+@dataclass(frozen=True)
+class MultiPreset:
+    name: str
+    policy: Policy
+    transports: tuple[MultiPresetTransport, ...]
+    status_overrides: tuple[StatusOverride, ...] = ()
+    bed_overrides: tuple[BedOverride, ...] = ()
+
+
+MULTI_NORMAL = MultiPreset(
+    name="MULTI_NORMAL",
+    policy=Policy.MANUAL,
+    transports=(
+        MultiPresetTransport(Patient(id="P1", acuity=3, condition=ConditionCategory.GENERAL, age_group=AgeGroup.ADULT), (5.0, 5.0)),
+        MultiPresetTransport(Patient(id="P2", acuity=4, condition=ConditionCategory.TRAUMA, age_group=AgeGroup.ADULT), (10.0, 10.0)),
+        MultiPresetTransport(Patient(id="P3", acuity=2, condition=ConditionCategory.CARDIAC, age_group=AgeGroup.ADULT), (15.0, 15.0)),
+    ),
+)
+
+LAST_BED_RACE = MultiPreset(
+    name="LAST_BED_RACE",
+    policy=Policy.MANUAL,
+    transports=(
+        MultiPresetTransport(Patient(id="P1", acuity=2, condition=ConditionCategory.GENERAL, age_group=AgeGroup.ADULT), (8.0, 9.0), target="Hospital_1"),
+        MultiPresetTransport(Patient(id="P2", acuity=2, condition=ConditionCategory.GENERAL, age_group=AgeGroup.ADULT), (8.0, 9.0), target="Hospital_1"),
+    ),
+    # Hospital_3 has no ICU beds at all in the base seed; drop Hospital_1's
+    # (which does) down to a single one so the second transport's identical
+    # request genuinely races the first for it.
+    bed_overrides=(BedOverride(at_ms=0, hospital_id="Hospital_1", bed_type=BedType.ICU, total=1),),
+)
+
+DECLINE_CHAIN = MultiPreset(
+    name="DECLINE_CHAIN",
+    policy=Policy.AUTO,
+    transports=(
+        MultiPresetTransport(Patient(id="P1", acuity=4, condition=ConditionCategory.TRAUMA, age_group=AgeGroup.ADULT), (8.0, 8.0)),
+    ),
+    # Take the two closest trauma-capable hospitals out of contention right
+    # before the transport starts: Hospital_1 loses its trauma surgeon,
+    # Hospital_5 (no trauma capability) never mattered anyway, so give
+    # Hospital_6 (the next-closest with a trauma capability) a full GENERAL
+    # ward — leaving only the third-closest, Hospital_4, to accept.
+    status_overrides=(
+        StatusOverride(at_ms=0, hospital_id="Hospital_1", changes={"specialists_on_shift": []}),
+    ),
+    bed_overrides=(BedOverride(at_ms=0, hospital_id="Hospital_6", bed_type=BedType.GENERAL, total=0),),
+)
+
+CAPACITY_DROP = MultiPreset(
+    name="CAPACITY_DROP",
+    policy=Policy.MANUAL,
+    transports=tuple(
+        MultiPresetTransport(
+            Patient(id=f"P{i}", acuity=2, condition=ConditionCategory.GENERAL, age_group=AgeGroup.ADULT), (8.0, 8.0)
+        )
+        for i in range(4)
+    ),
+    bed_overrides=(BedOverride(at_ms=3000, hospital_id="Hospital_1", bed_type=BedType.ICU, total=2),),
+)
+
+MASS_CASUALTY = MultiPreset(
+    name="MASS_CASUALTY",
+    policy=Policy.AUTO,
+    transports=tuple(
+        MultiPresetTransport(
+            Patient(id=f"P{i}", acuity=(i % 5) + 1, condition=ConditionCategory.GENERAL, age_group=AgeGroup.ADULT),
+            (float(4 + i * 3 % 36), float(4 + i * 7 % 36)),
+        )
+        for i in range(10)
+    ),
+    status_overrides=(StatusOverride(at_ms=4000, hospital_id="Hospital_2", changes={"diversion": "FULL"}),),
+)
+
+ALL_MULTI_PRESETS: dict[str, MultiPreset] = {
+    preset.name: preset for preset in (MULTI_NORMAL, LAST_BED_RACE, DECLINE_CHAIN, CAPACITY_DROP, MASS_CASUALTY)
+}
+
 
 ALL_PRESETS: dict[str, Preset] = {
     preset.name: preset

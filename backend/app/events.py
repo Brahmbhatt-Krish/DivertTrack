@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -32,6 +33,37 @@ class EventType(Enum):
     BOUND_EXCEEDED = "BoundExceeded"
     FACILITY_STATE_CHANGED = "FacilityStateChanged"
     ARRIVED = "Arrived"
+
+    # -- Phase 12+ (multi-hospital capacity extension) --------------------
+    # Only the three the bed ledger itself replays are added here; the rest
+    # of the extension's new event types (BedsReported, HospitalStatusChanged,
+    # CandidateDeclined, ...) belong to the phases that actually emit them
+    # (13-15/18), not this pure, read-only ledger.
+    BED_RESERVED = "BedReserved"
+    BED_RELEASED = "BedReleased"
+    BED_OCCUPIED = "BedOccupied"
+    # Phase 13 (dispatcher: reservation, candidate iteration, policy):
+    CANDIDATE_DECLINED = "CandidateDeclined"
+    LATE_DECLINE_IGNORED = "LateDeclineIgnored"
+    AUTO_REDIRECT = "AutoRedirect"
+    NO_ACCEPTING_FACILITY = "NoAcceptingFacility"
+    # Phase 14 (facility: acceptance on PREPARE, live status, drift):
+    HOSPITAL_STATUS_CHANGED = "HospitalStatusChanged"
+    BEDS_REPORTED = "BedsReported"
+    # Phase 15 (R18, capacity rebalance):
+    CAPACITY_REBALANCE = "CapacityRebalance"
+    # Phase 21: the hospital roster itself. Until these existed, *which*
+    # hospitals were in the network was static config read at import time —
+    # the one part of the system state that could not be reconstructed by
+    # replaying the log. These close that gap: the roster is now derived from
+    # events like everything else (see projection.project_hospitals).
+    #
+    # Like the other hospital-scoped events, these carry the hospital id in
+    # `transport_id` — the column is NOT NULL and predates them. See
+    # project_hospitals for why that stays a deliberate convention.
+    HOSPITAL_REGISTERED = "HospitalRegistered"
+    HOSPITAL_UPDATED = "HospitalUpdated"
+    HOSPITAL_DECOMMISSIONED = "HospitalDecommissioned"
 
 
 @dataclass(frozen=True)
@@ -75,45 +107,71 @@ class EventStore:
         # check_same_thread=False: Phase 8's fuzz endpoint runs the
         # simulation on a background thread while the store may still be
         # queried from the request-handling thread.
+        #
+        # That flag only *permits* cross-thread use — it does not serialize
+        # it, and concurrent use of one connection raises
+        # "sqlite3.InterfaceError: bad parameter or other API misuse". Under
+        # a real server there are genuinely three writers/readers in play:
+        # sync route handlers (on FastAPI's threadpool), bus deliveries and
+        # ambulance ticks (on the event loop via RealClock), and the fuzz
+        # background task. Hence the lock below, held only around actual
+        # connection calls.
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._lock = threading.RLock()
         self._conn.execute(_CREATE_TABLE_SQL)
         self._conn.execute(_CREATE_INDEX_SQL)
         self._conn.commit()
         self._subscribers: list[Callable[[Event], None]] = []
+        # Bumped on every append/clear. Readers that derive something
+        # expensive from the whole log (the global invariant check, a
+        # facility's ledger view) memoize against this instead of
+        # recomputing per call — a plain integer compare replaces an
+        # O(events) replay when nothing has changed since last time.
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def append(self, event: Event) -> Event:
         if event.seq is not None:
             raise ValueError(
                 f"Expected an unpersisted event (seq=None), received seq={event.seq}"
             )
-        cursor = self._conn.execute(
-            "INSERT INTO events (transport_id, epoch, ts_ms, type, facility_id, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                event.transport_id,
-                event.epoch,
-                event.ts_ms,
-                event.type.value,
-                event.facility_id,
-                json.dumps(event.payload),
-            ),
-        )
-        self._conn.commit()
-        persisted = dataclasses.replace(event, seq=cursor.lastrowid)
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO events (transport_id, epoch, ts_ms, type, facility_id, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event.transport_id,
+                    event.epoch,
+                    event.ts_ms,
+                    event.type.value,
+                    event.facility_id,
+                    json.dumps(event.payload),
+                ),
+            )
+            self._conn.commit()
+            self._revision += 1
+            persisted = dataclasses.replace(event, seq=cursor.lastrowid)
+        # Subscribers run outside the lock: they are free to read the store
+        # back (the hub replays for its projection), which would otherwise
+        # re-enter it on the same call stack.
         for subscriber in self._subscribers:
             subscriber(persisted)
         return persisted
 
     def replay(self, transport_id: Optional[str] = None) -> list[Event]:
-        if transport_id is None:
-            rows = self._conn.execute(
-                f"SELECT {_SELECT_COLUMNS} FROM events ORDER BY seq"
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"SELECT {_SELECT_COLUMNS} FROM events WHERE transport_id = ? ORDER BY seq",
-                (transport_id,),
-            ).fetchall()
+        with self._lock:
+            if transport_id is None:
+                rows = self._conn.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM events ORDER BY seq"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT {_SELECT_COLUMNS} FROM events WHERE transport_id = ? ORDER BY seq",
+                    (transport_id,),
+                ).fetchall()
         return [_row_to_event(row) for row in rows]
 
     def subscribe(self, fn: Callable[[Event], None]) -> None:
@@ -123,8 +181,10 @@ class EventStore:
         """Wipes the log — used by POST /demo/reset. Subscribers are left
         registered; seq is not restarted, since nothing depends on it
         beginning at 1 after a reset, only on staying monotonic."""
-        self._conn.execute("DELETE FROM events")
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM events")
+            self._conn.commit()
+            self._revision += 1
 
 
 def _row_to_event(row: tuple) -> Event:

@@ -11,12 +11,16 @@ row; the _log_* methods are what each pipeline step logs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Callable, Optional, Protocol
 
+from app.acceptance import accept
 from app.clock import Clock, Handle
 from app.config import Config
 from app.events import Event, EventStore, EventType
 from app.messages import Ack, AckType, ActionType, Command, FacilityState
+from app.models import Hospital, HospitalStatus, Patient, initial_status
+from app.projection import apply_status_event as _apply_status_event
+from app.projection import empty_ledger_view, project_ledger
 
 # Every clock.schedule() a Facility makes for a transport is registered here
 # so the epoch fence (step 4) can cancel *any* stale pending action — a
@@ -41,6 +45,11 @@ class _TransportRecord:
     processed: dict[str, Ack] = field(default_factory=dict)
     scheduled: dict[_ScheduledKey, Handle] = field(default_factory=dict)
     pending_ready: list[Ack] = field(default_factory=list)
+    # Phase 14 (F2): the PREPARE command_id that armed this transport, so
+    # decline_now() — not itself triggered by an incoming command — can
+    # still send a DECLINED ack the dispatcher recognizes (it fences acks
+    # by matching this same command_id against its own prepare_command_id).
+    armed_command_id: Optional[str] = None
 
 
 class Facility:
@@ -52,6 +61,7 @@ class Facility:
         bus: MessageSender,
         config: Config,
         manual_ready: bool = False,
+        hospital: Optional[Hospital] = None,
     ) -> None:
         self.id = facility_id
         self._clock = clock
@@ -60,12 +70,33 @@ class Facility:
         self._config = config
         self._manual_ready = manual_ready
         self._transports: dict[str, _TransportRecord] = {}
+        # Phase 14: `hospital` is None for every pre-existing caller (the
+        # plain 3-hospital demo never passes it) — PREPARE always arms
+        # unconditionally in that case, exactly as before. Capacity-aware
+        # callers (Phase 15's Simulation) pass the Hospital this facility
+        # represents; `_status` then tracks its live state, replayed purely
+        # from HospitalStatusChanged/BedsReported (see on_status_event).
+        self._hospital = hospital
+        self._status: Optional[HospitalStatus] = initial_status(hospital) if hospital is not None else None
+        self._known_patients: dict[str, Patient] = {}
+        self._ledger_cache: Optional[tuple[int, object]] = None  # (store revision, this hospital's view)
         self._transitions: dict[
             tuple[FacilityState, ActionType], Callable[[_TransportRecord, Command], None]
         ] = {
             (FacilityState.IDLE, ActionType.PREPARE): self._handle_prepare,
             (FacilityState.WITHDRAWN, ActionType.PREPARE): self._handle_prepare,
             (FacilityState.ARMED, ActionType.PREPARE): self._handle_prepare,
+            # A PREPARE only ever reaches here at a fresh, fenced-in epoch
+            # (pipeline step 4 already rejected anything stale) — so a
+            # facility still locally ACTIVE from an abandoned plan is being
+            # asked to prepare for a genuinely new one. Without this row,
+            # such a PREPARE is IllegalTransition and this facility is
+            # orphaned ACTIVE forever: the epoch fence that let the PREPARE
+            # through also cancels this facility's own still-pending
+            # WITHDRAW_AT from the old plan (same fence, "cancel every
+            # scheduled action with a lower epoch"), so nothing else would
+            # ever move it out of ACTIVE.
+            (FacilityState.ACTIVE, ActionType.PREPARE): self._handle_prepare,
             (FacilityState.ARMED, ActionType.ACTIVATE_AT): self._handle_activate_at,
             (FacilityState.ACTIVE, ActionType.WITHDRAW_AT): self._handle_withdraw_at,
             (FacilityState.ARMED, ActionType.WITHDRAW): self._handle_withdraw,
@@ -80,6 +111,10 @@ class Facility:
 
     def highest_applied_epoch_of(self, transport_id: str) -> int:
         return self._record_for(transport_id).highest_applied_epoch
+
+    def status_of(self) -> Optional[HospitalStatus]:
+        """None for a plain (non-capacity-aware) facility — see __init__."""
+        return self._status
 
     def set_manual_ready(self, enabled: bool) -> None:
         """Runtime toggle for the demo's manual-mode control (Phase 9) —
@@ -131,11 +166,89 @@ class Facility:
         for ack in pending:
             self._bus.send(ack)
 
+    # -- F2: decline_now() — withdrawing an acceptance before commitment ----
+
+    def decline_now(self, transport_id: str, reason: str) -> None:
+        """Used by the status-drift routine (F4) when a bed or specialist a
+        transport was accepted for is lost before commitment. Allowed only
+        while ARMED with no ACTIVATE_AT scheduled yet — once RECEIVED for
+        ACTIVATE_AT has gone out, this facility is committed (R16 mirrors
+        this on the dispatcher's side: a DECLINED arriving after that point
+        is LateDeclineIgnored, never processed)."""
+        record = self._record_for(transport_id)
+        has_scheduled_activate = any(action is ActionType.ACTIVATE_AT for _epoch, action in record.scheduled)
+        if record.state is not FacilityState.ARMED or has_scheduled_activate:
+            raise ValueError("committed")
+
+        old_state = record.state
+        record.state = FacilityState.WITHDRAWN
+        epoch = record.highest_applied_epoch
+        command_id = record.armed_command_id or f"decline-now-{transport_id}"
+        self._store.append(
+            Event(
+                transport_id=transport_id, epoch=epoch, ts_ms=self._clock.now_ms(),
+                type=EventType.FACILITY_STATE_CHANGED, facility_id=self.id,
+                payload={"from": old_state.value, "to": FacilityState.WITHDRAWN.value, "command_id": command_id, "action": "decline_now"},
+            )
+        )
+        ack = Ack(
+            command_id=command_id, transport_id=transport_id, facility_id=self.id, epoch=epoch,
+            ack_type=AckType.DECLINED, applied_state=FacilityState.WITHDRAWN,
+            sent_at_ms=self._clock.now_ms(), reason=reason,
+        )
+        self._bus.send(ack)
+
+    # -- F3: live status, replayed the same way as everything else ----------
+
+    def set_hospital(self, hospital) -> None:
+        """Phase 21: re-point this facility at an updated Hospital record.
+
+        The live status is kept, not rebuilt from initial_status(): status is
+        event-sourced and belongs to the facility's history, while the
+        Hospital record is its static configuration. Re-deriving it here
+        would silently wipe a diversion or an off-shift specialist every time
+        an administrator renamed the hospital."""
+        self._hospital = hospital
+
+    def restore_status(self, status) -> None:
+        """Replace the live status wholesale, without emitting anything.
+
+        Used only when rebuilding from the log at startup (E21): the events
+        that produced this status are already persisted, so re-applying them
+        through the normal path would duplicate them."""
+        self._status = status
+
+    def on_status_event(self, event: Event) -> None:
+        """Called with a HospitalStatusChanged/BedsReported event as it's
+        appended (Phase 15 wires this the same way Hub subscribes to the
+        store) — updates this facility's live status via the pure
+        projection.apply_status_event(), so the status F1 checks against is
+        always exactly what replaying the log would produce, never
+        separately-mutated state that could drift from it."""
+        if self._status is None:
+            return  # a plain (non-capacity-aware) facility has no status to update
+        self._status = _apply_status_event(self._status, event)
+
     # -- transition table (spec table, one method per row) -------------------
 
     def _handle_prepare(self, record: _TransportRecord, command: Command) -> None:
         already_armed = record.state == FacilityState.ARMED
+
+        # F1: acceptance runs once, on the first PREPARE for a capacity-
+        # aware transport — a resend while already ARMED just re-confirms
+        # (the transition table's own "PREPARE (same or higher epoch) ->
+        # stay ARMED" row), it doesn't re-litigate a decision already made.
+        if self._hospital is not None and command.patient is not None and not already_armed:
+            self._known_patients[command.transport_id] = command.patient
+            eta = command.eta_minutes if command.eta_minutes is not None else 0.0
+            view = self._ledger_view()
+            decision = accept(command.patient, self._hospital, self._status, view, eta, self._config.saturation_limit)
+            if not decision.accepted:
+                self._decline(record, command, decision.reason)
+                return
+
         self._apply_state(record, command, FacilityState.ARMED)
+        record.armed_command_id = command.command_id
         ack = self._build_ack(command, AckType.READY, FacilityState.ARMED)
         record.processed[command.command_id] = ack
 
@@ -151,6 +264,41 @@ class Facility:
                 self._config.prep_ms, lambda: self._send_scheduled(record, key, ack)
             )
             record.scheduled[key] = handle
+
+    def _ledger_view(self):
+        """This facility's own view of the bed ledger, derived from the log
+        (the facility is not the ledger's writer — the dispatcher is — so it
+        can't mirror it incrementally the way dispatcher.py does). Memoized
+        against the store's revision so repeated PREPAREs between appends
+        don't each replay the whole log."""
+        revision = self._store.revision
+        if self._ledger_cache is None or self._ledger_cache[0] != revision:
+            ledger = project_ledger(self._store.replay(), self._known_patients)
+            self._ledger_cache = (revision, ledger.get(self.id, empty_ledger_view(self.id)))
+        return self._ledger_cache[1]
+
+    def _decline(self, record: _TransportRecord, command: Command, reason: str) -> None:
+        """F1's decline path: state is left unchanged (the transition table
+        row this would-be transition maps to never actually fires), the
+        epoch fence was already raised by the pipeline's step 4 before this
+        ever ran, and DECLINED goes out in place of READY."""
+        ack = Ack(
+            command_id=command.command_id, transport_id=command.transport_id, facility_id=self.id,
+            epoch=command.epoch, ack_type=AckType.DECLINED, applied_state=record.state,
+            sent_at_ms=self._clock.now_ms(), reason=reason,
+        )
+        record.processed[command.command_id] = ack
+        self._store.append(
+            Event(
+                transport_id=command.transport_id, epoch=command.epoch, ts_ms=self._clock.now_ms(),
+                type=EventType.FACILITY_STATE_CHANGED, facility_id=self.id,
+                payload={
+                    "from": record.state.value, "to": record.state.value,
+                    "command_id": command.command_id, "action": command.action.value, "declined": reason,
+                },
+            )
+        )
+        self._bus.send(ack)
 
     def _handle_activate_at(self, record: _TransportRecord, command: Command) -> None:
         self._handle_scheduled_transition(record, command, FacilityState.ACTIVE, ActionType.ACTIVATE_AT)

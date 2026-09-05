@@ -1,10 +1,14 @@
 // State badge, epoch, STALE badge, and the last accepted / last rejected
 // command — all derived here from the shared timeline, not fetched.
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+
 const STATE_STYLES = {
-  IDLE: "bg-slate-100 text-slate-600",
-  ARMED: "bg-amber-100 text-amber-700",
-  ACTIVE: "bg-emerald-100 text-emerald-700",
-  WITHDRAWN: "bg-slate-200 text-slate-500",
+  IDLE: "border-border bg-muted text-muted-foreground",
+  ARMED: "border-warning-border bg-warning-soft text-warning",
+  ACTIVE: "border-success-border bg-success-soft text-success",
+  WITHDRAWN: "border-border bg-muted text-muted-foreground",
 };
 
 const ACCEPTED_TYPES = new Set(["FacilityStateChanged"]);
@@ -33,31 +37,38 @@ export default function FacilityCard({ facilityId, view, events, large = false }
   const lastRejected = lastMatching(events, facilityId, (e) => REJECTED_TYPES.has(e.type));
 
   return (
-    <div className={`rounded-lg border border-slate-200 bg-white p-4 ${large ? "text-lg" : ""}`}>
-      <div className="flex items-center justify-between">
-        <h3 className={`font-semibold text-slate-900 ${large ? "text-2xl" : ""}`}>{facilityId}</h3>
-        {stale && (
-          <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-bold tracking-wide text-amber-700">
-            STALE
+    <Card className={cn("gap-0 py-4", large && "py-6")}>
+      <CardHeader className="px-4 pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className={cn("font-mono text-sm", large && "text-xl")}>{facilityId}</CardTitle>
+          {stale && (
+            <Badge variant="outline" className="border-warning-border bg-warning-soft text-warning">
+              STALE
+            </Badge>
+          )}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <Badge variant="outline" className={cn("font-medium", STATE_STYLES[state] ?? STATE_STYLES.IDLE)}>
+            {state}
+          </Badge>
+          <span className="text-xs text-muted-foreground">epoch {epoch}</span>
+        </div>
+      </CardHeader>
+
+      <CardContent className="space-y-1.5 px-4 text-xs">
+        <div className="flex gap-2">
+          <span className="w-24 shrink-0 text-muted-foreground">Last accepted</span>
+          <span className="truncate" title={describe(lastAccepted)}>
+            {describe(lastAccepted)}
           </span>
-        )}
-      </div>
-      <div className="mt-2 flex items-center gap-2">
-        <span className={`rounded px-2 py-0.5 text-xs font-semibold ${STATE_STYLES[state] ?? "bg-slate-100"}`}>
-          {state}
-        </span>
-        <span className="text-xs text-slate-500">epoch {epoch}</span>
-      </div>
-      <dl className="mt-3 space-y-1 text-xs text-slate-600">
-        <div>
-          <dt className="inline font-medium text-slate-700">Last accepted: </dt>
-          <dd className="inline">{describe(lastAccepted)}</dd>
         </div>
-        <div>
-          <dt className="inline font-medium text-slate-700">Last rejected: </dt>
-          <dd className="inline">{describe(lastRejected)}</dd>
+        <div className="flex gap-2">
+          <span className="w-24 shrink-0 text-muted-foreground">Last rejected</span>
+          <span className="truncate" title={describe(lastRejected)}>
+            {describe(lastRejected)}
+          </span>
         </div>
-      </dl>
-    </div>
+      </CardContent>
+    </Card>
   );
 }

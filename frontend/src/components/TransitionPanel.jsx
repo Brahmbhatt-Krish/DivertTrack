@@ -2,6 +2,10 @@
 // four things R3-R5 wait on: READY, the ambulance's notice-applied,
 // ACTIVATE's RECEIVED, and WithdrawSent.
 import { useEffect, useRef, useState } from "react";
+import { ArrowRight, Check, Circle } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 
 export default function TransitionPanel({ view, events }) {
   const [, forceTick] = useState(0);
@@ -14,9 +18,12 @@ export default function TransitionPanel({ view, events }) {
 
   if (!view || view.pending_destination == null) {
     return (
-      <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm text-slate-400">
-        No transition in progress.
-      </div>
+      <Card className="py-0">
+        <CardContent className="flex items-center gap-2 px-4 py-3.5 text-sm text-muted-foreground">
+          <Circle className="size-3.5" />
+          No transition in progress.
+        </CardContent>
+      </Card>
     );
   }
 
@@ -51,33 +58,47 @@ export default function TransitionPanel({ view, events }) {
   const withdrawSent = epochEvents.some((e) => e.type === "WithdrawSent");
 
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4">
-      <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-slate-900">
-          Transitioning to <span className="text-sky-700">{view.pending_destination}</span>
-        </h3>
-        <span className="text-xs text-slate-500">{view.status}</span>
-      </div>
-      {remainingMs != null && (
-        <p className="mt-1 text-sm text-slate-600">
-          Cutover in <span className="font-mono font-semibold">{remainingMs}</span> ms
-        </p>
-      )}
-      <ul className="mt-3 grid grid-cols-2 gap-1 text-sm">
+    <Card className="gap-0 py-4">
+      <CardHeader className="px-4 pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <span className="text-muted-foreground">Transitioning</span>
+            <ArrowRight className="size-3.5 text-muted-foreground" />
+            <span className="font-mono">{view.pending_destination}</span>
+          </CardTitle>
+          <div className="flex items-center gap-2">
+            {remainingMs != null && (
+              <span className="text-xs text-muted-foreground">
+                cutover in <span className="font-mono font-semibold text-foreground">{remainingMs}</span>ms
+              </span>
+            )}
+            <Badge variant="secondary">{view.status}</Badge>
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="grid grid-cols-1 gap-2 px-4 sm:grid-cols-2">
         <Tick label="READY" done={ready} />
         <Tick label="Ambulance notice applied" done={noticeApplied} />
         <Tick label="ACTIVATE received" done={activateReceived} />
         <Tick label="WITHDRAW sent" done={withdrawSent} />
-      </ul>
-    </div>
+      </CardContent>
+    </Card>
   );
 }
 
 function Tick({ label, done }) {
   return (
-    <li className={`flex items-center gap-1.5 ${done ? "text-emerald-600" : "text-slate-400"}`}>
-      <span>{done ? "✓" : "○"}</span>
+    <div className={cn("flex items-center gap-2 text-sm", done ? "text-foreground" : "text-muted-foreground")}>
+      <span
+        className={cn(
+          "flex size-4 items-center justify-center rounded-full border",
+          done ? "border-success bg-success text-white" : "border-border",
+        )}
+      >
+        {done && <Check className="size-3" strokeWidth={3} />}
+      </span>
       {label}
-    </li>
+    </div>
   );
 }

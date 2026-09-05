@@ -1,15 +1,32 @@
+import { Activity } from "lucide-react";
+import { cn } from "@/lib/utils";
+
 export default function TopBar({ connected }) {
   return (
-    <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
-      <h1 className="text-lg font-semibold text-slate-900">DivertTrack</h1>
-      <span
-        className={`flex items-center gap-1.5 text-xs font-medium ${
-          connected ? "text-emerald-600" : "text-red-600"
-        }`}
-      >
-        <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-500" : "bg-red-500"}`} />
-        {connected ? "live" : "disconnected"}
-      </span>
+    <header className="sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+      <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-6">
+        <div className="flex items-center gap-2.5">
+          <div className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
+            <Activity className="size-4" />
+          </div>
+          <div className="leading-none">
+            <span className="text-sm font-semibold tracking-tight">DivertTrack</span>
+            <span className="ml-2 text-xs text-muted-foreground">ambulance destination handoff</span>
+          </div>
+        </div>
+
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium",
+            connected
+              ? "border-success-border bg-success-soft text-success"
+              : "border-danger-border bg-danger-soft text-danger",
+          )}
+        >
+          <span className={cn("size-1.5 rounded-full", connected ? "bg-success" : "bg-danger")} />
+          {connected ? "Live" : "Disconnected"}
+        </span>
+      </div>
     </header>
   );
 }

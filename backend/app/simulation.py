@@ -15,10 +15,13 @@ from app.checker import check
 from app.clock import Clock, FakeClock
 from app.config import Config
 from app.dispatcher import Dispatcher
-from app.events import Event, EventStore
+from app.events import Event, EventStore, EventType
 from app.facility import Facility
-from app.presets import ALL_PRESETS
-from app.projection import Projection, project
+from app.models import BedType, Hospital, Patient, hospital_to_payload, initial_status
+from app.presets import ALL_MULTI_PRESETS, ALL_PRESETS
+from app.projection import Projection, apply_status_event, project
+from app.projection import free as _ledger_free
+from app.projection import load as _ledger_load
 from app.seed import HOSPITALS, NETWORK
 
 _FACILITY_IDS = tuple(h.facility_id for h in HOSPITALS)
@@ -33,6 +36,7 @@ class Simulation:
         strict_bound: bool = True,
         min_delay_ms: Optional[int] = None,
         max_delay_ms: Optional[int] = None,
+        hospitals: Optional[dict[str, Hospital]] = None,
     ) -> None:
         self._clock = clock
         self._store = store
@@ -56,8 +60,20 @@ class Simulation:
             self._facilities[hospital.facility_id] = facility
             self._bus.register_endpoint(hospital.facility_id, facility.receive_command)
 
+        # Phase 12+: a second, richer hospital set (six of them, capacity-
+        # aware) alongside — not replacing — the three plain ones above.
+        # `hospitals` is None for every pre-existing caller.
+        self._hospitals: dict[str, Hospital] = dict(hospitals or {})
+        for hospital in self._hospitals.values():
+            facility = Facility(hospital.id, clock, store, self._bus, config, hospital=hospital)
+            self._facilities[hospital.id] = facility
+            self._bus.register_endpoint(hospital.id, facility.receive_command)
+
         self._ambulances: dict[str, Ambulance] = {}
-        self._dispatcher = Dispatcher(clock, store, self._bus, config)
+        self._dispatcher = Dispatcher(
+            clock, store, self._bus, config, hospitals=self._hospitals,
+            on_no_destination=self._stand_down_ambulance,
+        )
         self._bus.register_dispatcher(self._dispatcher.on_ack)
 
     # -- read-only access for callers that need it (tests, main.py) --------
@@ -65,6 +81,10 @@ class Simulation:
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
+
+    @property
+    def hospitals(self) -> dict[str, Hospital]:
+        return dict(self._hospitals)
 
     @property
     def facilities(self) -> dict[str, Facility]:
@@ -82,8 +102,207 @@ class Simulation:
         self._bus.register_endpoint(transport_id, ambulance.receive_command)
         self._dispatcher.start(transport_id, destination)
 
-    def redirect(self, transport_id: str, target: str) -> None:
+    def redirect(self, transport_id: str, target: Optional[str] = None) -> None:
         self._dispatcher.redirect(transport_id, target)
+
+    def start_capacity_aware(
+        self, transport_id: str, patient: Patient, position: tuple[float, float], destination: Optional[str] = None
+    ) -> None:
+        """Phase 15: one capacity-aware transport, wired end to end — a
+        real Ambulance with M1/M2 position-based movement, its arrival
+        reported back to the dispatcher (R19) and its live position kept in
+        sync on every tick (so a later redirect's eta_minutes reflects
+        where it actually is, not where it started — M2)."""
+        ambulance = Ambulance(
+            transport_id, self._clock, self._store, self._bus, self._config,
+            hospitals=self._hospitals, position=position, on_arrived=self._dispatcher.on_arrived,
+            on_position_changed=self._dispatcher.update_position,
+        )
+        self._ambulances[transport_id] = ambulance
+        self._bus.register_endpoint(transport_id, ambulance.receive_command)
+        self._dispatcher.start(transport_id, destination=destination, patient=patient, position=position)
+
+    # -- Phase 21: the roster is mutable at runtime ------------------------
+
+    def register_hospital(self, hospital: Hospital, *, log: bool = True) -> None:
+        """Bring a hospital into the network mid-run.
+
+        Three things have to happen together or the hospital is a ghost that
+        wins rankings and never answers: it needs a Facility, that Facility
+        needs a bus endpoint (PREPARE is addressed by id), and the dispatcher
+        needs a status entry. Registration used to be construction-only, so
+        all three were impossible after startup.
+
+        `log=False` is for replaying a roster that is already in the log —
+        bootstrap and restart — where re-appending would duplicate history."""
+        existing = self._facilities.get(hospital.id)
+        self._hospitals[hospital.id] = hospital
+        if existing is None:
+            facility = Facility(hospital.id, self._clock, self._store, self._bus, self._config, hospital=hospital)
+            self._facilities[hospital.id] = facility
+            self._bus.register_endpoint(hospital.id, facility.receive_command)
+        self._dispatcher.add_hospital(hospital)
+        if log:
+            self._store.append(
+                Event(
+                    transport_id=hospital.id, epoch=0, ts_ms=self._clock.now_ms(),
+                    type=EventType.HOSPITAL_REGISTERED, facility_id=hospital.id,
+                    payload=hospital_to_payload(hospital),
+                )
+            )
+
+    def restore_hospital_status_from_log(self) -> None:
+        """Re-derive every hospital's live status by replaying the log (E21).
+
+        Registration alone is not enough to rebuild the network: a hospital
+        put on diversion, or whose bed count was changed, must come back that
+        way after a restart. Without this the running system believed every
+        hospital was wide open while checker.py — which does replay the whole
+        log — knew better, and the two disagreed about whether an acceptance
+        was legal. Uses the same pure apply_status_event the checker uses, so
+        they cannot drift."""
+        events = self._store.replay()
+        by_hospital: dict[str, list[Event]] = {}
+        for event in events:
+            if event.type in (EventType.HOSPITAL_STATUS_CHANGED, EventType.BEDS_REPORTED):
+                if event.facility_id is not None:
+                    by_hospital.setdefault(event.facility_id, []).append(event)
+        for hospital_id, hospital in self._hospitals.items():
+            status = initial_status(hospital)
+            for event in by_hospital.get(hospital_id, []):
+                status = apply_status_event(status, event)
+            facility = self._facilities.get(hospital_id)
+            if facility is not None:
+                facility.restore_status(status)
+            self._dispatcher.restore_hospital_status(hospital_id, status)
+
+    def update_hospital(self, hospital: Hospital) -> None:
+        """Re-configure a hospital in place (capabilities, name, location).
+        The Facility keeps its identity and its live status — only the static
+        record it was built from changes."""
+        self._hospitals[hospital.id] = hospital
+        facility = self._facilities.get(hospital.id)
+        if facility is not None:
+            facility.set_hospital(hospital)
+        self._dispatcher.add_hospital(hospital)
+        self._store.append(
+            Event(
+                transport_id=hospital.id, epoch=0, ts_ms=self._clock.now_ms(),
+                type=EventType.HOSPITAL_UPDATED, facility_id=hospital.id,
+                payload=hospital_to_payload(hospital),
+            )
+        )
+
+    def decommission_hospital(self, hospital_id: str, reason: str = "decommissioned") -> None:
+        """Retire a hospital that may have ambulances already driving to it.
+
+        Deliberately expressed in terms the system already understands rather
+        than as a new teardown path: closing a hospital *is* its capacity
+        going to zero. Reporting every bed type to 0 runs R18's existing
+        rebalance, which displaces the transports holding those beds and
+        re-routes them through the ordinary redirect protocol — so the
+        one-active-facility invariant is preserved by the same machinery that
+        preserves it everywhere else. FULL diversion stops it being chosen
+        again on the way out."""
+        if hospital_id not in self._hospitals:
+            raise KeyError(hospital_id)
+        self.report_hospital_status(hospital_id, {"diversion": "FULL"})
+        for bed_type in list(self._hospitals[hospital_id].beds_total):
+            self.report_beds(hospital_id, bed_type, 0)
+        self._dispatcher.remove_hospital(hospital_id)
+        self._hospitals.pop(hospital_id, None)
+        self._store.append(
+            Event(
+                transport_id=hospital_id, epoch=0, ts_ms=self._clock.now_ms(),
+                type=EventType.HOSPITAL_DECOMMISSIONED, facility_id=hospital_id,
+                payload={"hospital_id": hospital_id, "reason": reason},
+            )
+        )
+
+    def report_hospital_status(self, hospital_id: str, changes: dict) -> None:
+        """Phase 17's POST /hospitals/{id}/status."""
+        event = self._store.append(
+            Event(
+                transport_id=hospital_id, epoch=0, ts_ms=self._clock.now_ms(),
+                type=EventType.HOSPITAL_STATUS_CHANGED, facility_id=hospital_id, payload=changes,
+            )
+        )
+        facility = self._facilities.get(hospital_id)
+        if facility is not None:
+            facility.on_status_event(event)
+            status = facility.status_of()
+            if status is not None:
+                self._dispatcher.on_hospital_status_changed(hospital_id, status)
+
+    def report_beds(self, hospital_id: str, bed_type: BedType, total: int) -> None:
+        """Phase 17's POST /hospitals/{id}/beds."""
+        event = self._store.append(
+            Event(
+                transport_id=hospital_id, epoch=0, ts_ms=self._clock.now_ms(),
+                type=EventType.BEDS_REPORTED, facility_id=hospital_id,
+                payload={"bed_type": bed_type.value, "total": total},
+            )
+        )
+        facility = self._facilities.get(hospital_id)
+        if facility is not None:
+            facility.on_status_event(event)
+        self._dispatcher.on_beds_reported(hospital_id, bed_type, total)
+
+    def run_multi_preset(self, name: str) -> list[str]:
+        """Phase 17: runs one of presets.ALL_MULTI_PRESETS — applies any
+        at_ms=0 status/bed overrides immediately (so a preset like
+        LAST_BED_RACE/DECLINE_CHAIN, which needs a hospital already
+        deficient the instant its transports start, isn't racing its own
+        scheduled callback on a real clock), schedules the rest, then
+        starts every scripted transport."""
+        preset = ALL_MULTI_PRESETS[name]
+        self._dispatcher.set_policy(preset.policy)
+        for status_override in preset.status_overrides:
+            if status_override.at_ms <= 0:
+                self.report_hospital_status(status_override.hospital_id, status_override.changes)
+            else:
+                self._clock.schedule(
+                    status_override.at_ms,
+                    lambda o=status_override: self.report_hospital_status(o.hospital_id, o.changes),
+                )
+        for bed_override in preset.bed_overrides:
+            if bed_override.at_ms <= 0:
+                self.report_beds(bed_override.hospital_id, bed_override.bed_type, bed_override.total)
+            else:
+                self._clock.schedule(
+                    bed_override.at_ms,
+                    lambda o=bed_override: self.report_beds(o.hospital_id, o.bed_type, o.total),
+                )
+        from app.dispatcher import NotEligible
+
+        started: list[str] = []
+        for index, transport in enumerate(preset.transports):
+            transport_id = f"{name}-{transport.patient.id}-{index}"
+            try:
+                self.start_capacity_aware(transport_id, transport.patient, transport.position, transport.target)
+            except NotEligible:
+                pass  # E28: the second of two racing transports is expected to fail here in manual policy
+            started.append(transport_id)
+        return started
+
+    def start_batch(self, patients: Sequence[tuple[Patient, tuple[float, float]]]) -> list[str]:
+        """Phase 15/17: POST /transports/batch's engine — one fresh
+        transport_id per (patient, position) pair, each run through
+        start_capacity_aware with no explicit destination (auto-chosen via
+        rank()/choose()). A transport with genuinely no accepting hospital
+        (E30/R15's NoAcceptingFacility) doesn't crash the rest of the
+        batch — it's still returned, just never gets a destination."""
+        from app.dispatcher import NotEligible
+
+        started: list[str] = []
+        for index, (patient, position) in enumerate(patients):
+            transport_id = f"BATCH-{patient.id}-{index}"
+            try:
+                self.start_capacity_aware(transport_id, patient, position)
+            except NotEligible:
+                pass
+            started.append(transport_id)
+        return started
 
     def confirm(self, transport_id: str) -> None:
         """Manually applies whatever REDIRECT_NOTICE(s) that transport's
@@ -117,7 +336,84 @@ class Simulation:
         ambulance = self._ambulances.get(transport_id)
         if ambulance is None:
             return None
-        return {"known_destination": ambulance.known_destination, "progress": ambulance.progress}
+        return {
+            "known_destination": ambulance.known_destination,
+            "progress": ambulance.progress,
+            "position": ambulance.position,
+        }
+
+    def _stand_down_ambulance(self, transport_id: str, through_seq: int = 0) -> None:
+        """Dispatcher -> ambulance direction of the wiring in
+        start_capacity_aware (which wires the ambulance -> dispatcher
+        direction). Called when a transport is left with no destination at
+        all; see Ambulance.stand_down."""
+        ambulance = self._ambulances.get(transport_id)
+        if ambulance is not None:
+            ambulance.stand_down(through_seq)
+
+    def transport_list(self) -> list[dict]:
+        """One row per capacity-aware transport — the shape GET /transports
+        returns and the hub pushes as "transport_list". Defined once, here,
+        rather than in the route: the two used to be separate and the table
+        could only be refreshed by hand, which is exactly the drift this
+        avoids."""
+        projection = self.views()
+        rows: list[dict] = []
+        for transport_id in self._dispatcher.known_patients():
+            view = projection.transports.get(transport_id)
+            if view is None:
+                continue
+            rows.append(
+                {
+                    "transport_id": transport_id,
+                    "current_destination": view.current_destination,
+                    "pending_destination": view.pending_destination,
+                    "current_epoch": view.current_epoch,
+                    "status": view.status.value,
+                    "position": self._dispatcher.position_of(transport_id),
+                    # The hospital this transport actually reached, once its
+                    # Arrived event has been replayed. DispatcherStatus has no
+                    # ARRIVED member (arrival ends the journey, it isn't a
+                    # handoff state), so this is the only thing that tells a
+                    # transport still driving from one that has landed.
+                    "arrived_at": view.arrived_at,
+                }
+            )
+        return rows
+
+    def hospital_ids(self) -> list[str]:
+        return list(self._hospitals)
+
+    def hospital_view(self, hospital_id: str) -> Optional[dict]:
+        if hospital_id not in self._hospitals:
+            return None
+        hospital = self._hospitals[hospital_id]
+        status = self._dispatcher.hospital_status_of(hospital_id)
+        view = self._dispatcher.ledger_view(hospital_id)
+        return {
+            "id": hospital.id,
+            "name": hospital.name,
+            "location": hospital.location,
+            "beds_total": {bed_type.value: total for bed_type, total in status.beds_total.items()},
+            "free": {bed_type.value: _ledger_free(view, status, bed_type) for bed_type in status.beds_total},
+            "load": _ledger_load(view, status),
+            # The reverse lookup: a bar reading 4/6 says nothing about *whose*
+            # four beds those are. Reserved and occupied are listed separately
+            # because they mean different things — a reservation is a bed held
+            # for an ambulance still en route and can still be released; an
+            # occupied bed has a patient in it.
+            "holders": {
+                bed_type.value: {
+                    "reserved": sorted(view.reserved.get(bed_type, frozenset())),
+                    "occupied": sorted(view.occupied.get(bed_type, frozenset())),
+                }
+                for bed_type in status.beds_total
+            },
+            "diversion": status.diversion.value,
+            "diverted_categories": [c.value for c in status.diverted_categories],
+            "ed_saturation": status.ed_saturation,
+            "specialists_on_shift": [s.value for s in status.specialists_on_shift],
+        }
 
     def run_preset(self, transport_id: str, name: str) -> None:
         preset = ALL_PRESETS[name]

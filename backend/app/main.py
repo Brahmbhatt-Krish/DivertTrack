@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -16,15 +16,22 @@ from app import ai
 from app.checker import CheckResult, check
 from app.clock import RealClock
 from app.config import Config
+from app.dispatcher import NotEligible, TargetRequired
 from app.events import Event, EventStore
-from app.presets import ALL_PRESETS
-from app.projection import FacilityView, TransportView
-from app.seed import HOSPITALS, TRANSPORT
+from app.models import (
+    AgeGroup, BedType, ConditionCategory, Diversion, Hospital, Need, Patient, Policy,
+    hospital_from_payload,
+)
+from app.presets import ALL_MULTI_PRESETS, ALL_PRESETS
+from app.projection import FacilityView, TransportView, project_hospitals
+from app.scoring import RankedCandidate
+from app.seed import HOSPITALS, MULTI_HOSPITALS, TRANSPORT
 from app.simulation import Simulation, run_random_fuzz
 from app.ws import Hub
 
 DEMO_TRANSPORT_ID = TRANSPORT.transport_id
 KNOWN_FACILITIES = frozenset(h.facility_id for h in HOSPITALS)
+MULTI_HOSPITALS_BY_ID = {h.id: h for h in MULTI_HOSPITALS}
 
 
 class AppState:
@@ -39,6 +46,8 @@ class AppState:
         self.clock = RealClock()
         self.simulation = Simulation(self.clock, self.store, config)
         self.hub = Hub()
+        # (store revision, result) for GET /invariant — see that route.
+        self.invariant_cache: Optional[tuple[int, CheckResult]] = None
 
 
 @asynccontextmanager
@@ -47,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the module-level `settings` singleton imported elsewhere — that lets
     # a test set DB_PATH before the app starts and have it actually take.
     state = AppState(Config.from_env())
+    _bootstrap_roster(state)
     state.hub.configure(asyncio.get_running_loop(), state.store, state.simulation)
     app.state.app_state = state
     yield
@@ -94,7 +104,116 @@ class StartTransportRequest(BaseModel):
 
 
 class RedirectRequest(BaseModel):
-    target: str
+    target: Optional[str] = None
+
+
+class BedsReportRequest(BaseModel):
+    bed_type: str
+    total: int
+
+
+class HospitalRequest(BaseModel):
+    """Phase 21: a hospital's static configuration, as an operator supplies
+    it. Enum members arrive as their string values and are validated in
+    _build_hospital so an unknown bed type or capability is a 400 naming the
+    field, not a 500."""
+
+    id: str
+    name: str
+    location: tuple[float, float]
+    beds_total: dict[str, int]
+    capabilities: list[str] = []
+    ventilators_total: int = 0
+    max_eta_minutes: dict[str, int] = {}
+
+
+class StatusChangeRequest(BaseModel):
+    specialists_on_shift: Optional[list[str]] = None
+    ed_saturation: Optional[float] = None
+    diversion: Optional[str] = None
+    diverted_categories: Optional[list[str]] = None
+
+
+class BatchPatientRequest(BaseModel):
+    id: str
+    acuity: int
+    condition: str
+    age_group: str = "ADULT"
+    needs: list[str] = []
+    override: str = "none"
+    position: tuple[float, float]
+
+
+class BatchStartRequest(BaseModel):
+    patients: list[BatchPatientRequest]
+
+
+class PolicyRequest(BaseModel):
+    mode: str  # "manual" | "auto"
+
+
+def _bootstrap_roster(state: "AppState") -> None:
+    """Bring the simulation's roster up to whatever the log says.
+
+    On a fresh log this writes seed.MULTI_HOSPITALS in as HospitalRegistered
+    events — the seed is now a *bootstrap*, not a source of truth. On a log
+    that already has roster events (a restart, E21) it replays them instead,
+    so a hospital an operator added survives a restart and one they retired
+    stays retired. Either way the roster ends up derived from the log.
+    """
+    roster = project_hospitals(state.store.replay()).active
+    if not roster:
+        for hospital in MULTI_HOSPITALS:
+            state.simulation.register_hospital(hospital)
+        return
+    for hospital in roster.values():
+        state.simulation.register_hospital(hospital, log=False)
+    # Registration restores *which* hospitals exist; this restores what state
+    # they are in (diversion, bed counts). Both have to come from the log or
+    # the running system and the invariant checker disagree about history.
+    state.simulation.restore_hospital_status_from_log()
+
+
+def _hospital_view(state: "AppState", hospital_id: str) -> dict:
+    return state.simulation.hospital_view(hospital_id)
+
+
+def _candidate_view(candidate: RankedCandidate) -> dict:
+    return {"hospital_id": candidate.hospital_id, "score": candidate.score, "reason": candidate.reason}
+
+
+def _build_hospital(body: "HospitalRequest") -> Hospital:
+    try:
+        return hospital_from_payload(body.model_dump())
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid hospital: {exc}") from exc
+
+
+def _build_patient(body: "BatchPatientRequest") -> Patient:
+    # The enums are validated here rather than left to raise: a bad
+    # condition/age_group/need is a malformed request, and letting ValueError
+    # escape turned it into a 500 with a traceback instead of a 400 naming the
+    # bad field (report_beds above already does this for BedType).
+    try:
+        condition = ConditionCategory(body.condition)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown condition {body.condition!r}") from exc
+    try:
+        age_group = AgeGroup(body.age_group)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown age group {body.age_group!r}") from exc
+    try:
+        needs = frozenset(Need(n) for n in body.needs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown need in {body.needs!r}") from exc
+    return Patient(
+        id=body.id,
+        acuity=body.acuity,
+        condition=condition,
+        age_group=age_group,
+        needs=needs,
+        override=body.override,
+    )
 
 
 @app.get("/health")
@@ -116,14 +235,175 @@ def create_transport(body: StartTransportRequest) -> TransportView:
     return _transport_view(state, body.transport_id)
 
 
-@app.post("/transports/{transport_id}/redirect")
-def redirect_transport(transport_id: str, body: RedirectRequest) -> TransportView:
+@app.post("/transports/{transport_id}/redirect", response_model=None)
+def redirect_transport(transport_id: str, body: RedirectRequest):
+    # No response_model: this returns a TransportView for the plain path
+    # (unchanged from before this extension) but a richer
+    # {"transport":..., "candidates":...} dict for a capacity-aware one —
+    # FastAPI can't validate both against one declared shape.
     state = _state()
     _require_redirectable(state, transport_id)
-    if body.target not in KNOWN_FACILITIES:
-        raise HTTPException(status_code=400, detail=f"Unknown facility {body.target!r}")
-    state.simulation.redirect(transport_id, body.target)
-    return _transport_view(state, transport_id)
+    is_capacity_aware = state.simulation.dispatcher.patient_of(transport_id) is not None
+    if not is_capacity_aware:
+        if body.target is None or body.target not in KNOWN_FACILITIES:
+            raise HTTPException(status_code=400, detail=f"Unknown facility {body.target!r}")
+        state.simulation.redirect(transport_id, body.target)
+        return _transport_view(state, transport_id)
+
+    if body.target is not None and body.target not in state.simulation.hospitals:
+        raise HTTPException(status_code=400, detail=f"Unknown hospital {body.target!r}")
+    try:
+        state.simulation.redirect(transport_id, body.target)
+    except NotEligible as exc:
+        raise HTTPException(status_code=409, detail={"error": "not_eligible", "reason": exc.reason}) from exc
+    except TargetRequired as exc:
+        # Omitting the target asks the dispatcher to choose, which only AUTO
+        # policy permits (under MANUAL the operator picks). That's a bad
+        # request, not a server fault — it used to escape as a 500.
+        #
+        # Deliberately not `except ValueError`: Pydantic's ValidationError is
+        # one too, and catching both reported genuine internal bugs as 400s.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    candidates = [_candidate_view(c) for c in state.simulation.dispatcher.candidates_of(transport_id)]
+    return {"transport": _transport_view(state, transport_id), "candidates": candidates}
+
+
+# -- Phase 17: multi-hospital capacity extension ----------------------------
+
+
+@app.get("/hospitals")
+def list_hospitals() -> list[dict]:
+    state = _state()
+    return [_hospital_view(state, hospital_id) for hospital_id in state.simulation.hospital_ids()]
+
+
+@app.post("/hospitals", status_code=201)
+def register_hospital(body: HospitalRequest) -> dict:
+    """Add a hospital to the live network. It is immediately rankable: the
+    dispatcher gets a status entry, a Facility is built, and its bus endpoint
+    is registered, so it can accept a PREPARE on the very next redirect."""
+    state = _state()
+    if body.id in state.simulation.hospitals:
+        raise HTTPException(status_code=409, detail=f"Hospital {body.id!r} already exists")
+    state.simulation.register_hospital(_build_hospital(body))
+    return _hospital_view(state, body.id)
+
+
+@app.put("/hospitals/{hospital_id}")
+def update_hospital(hospital_id: str, body: HospitalRequest) -> dict:
+    state = _state()
+    if hospital_id not in state.simulation.hospitals:
+        raise HTTPException(status_code=404, detail=f"Unknown hospital {hospital_id!r}")
+    if body.id != hospital_id:
+        raise HTTPException(status_code=400, detail="Body id must match the path id")
+    state.simulation.update_hospital(_build_hospital(body))
+    return _hospital_view(state, hospital_id)
+
+
+@app.delete("/hospitals/{hospital_id}")
+def decommission_hospital(hospital_id: str, reason: str = "decommissioned") -> dict:
+    """Retire a hospital, including one with ambulances already en route:
+    its capacity drops to zero, which runs the ordinary R18 rebalance and
+    re-routes those transports through the normal redirect protocol."""
+    state = _state()
+    if hospital_id not in state.simulation.hospitals:
+        raise HTTPException(status_code=404, detail=f"Unknown hospital {hospital_id!r}")
+    state.simulation.decommission_hospital(hospital_id, reason)
+    return {"decommissioned": hospital_id, "remaining": state.simulation.hospital_ids()}
+
+
+@app.post("/hospitals/{hospital_id}/beds")
+def report_beds(hospital_id: str, body: BedsReportRequest) -> dict:
+    if hospital_id not in _state().simulation.hospitals:
+        raise HTTPException(status_code=404, detail=f"Unknown hospital {hospital_id!r}")
+    try:
+        bed_type = BedType(body.bed_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown bed type {body.bed_type!r}") from exc
+    state = _state()
+    state.simulation.report_beds(hospital_id, bed_type, body.total)
+    return _hospital_view(state, hospital_id)
+
+
+@app.post("/hospitals/{hospital_id}/status")
+def report_status(hospital_id: str, body: StatusChangeRequest) -> dict:
+    if hospital_id not in _state().simulation.hospitals:
+        raise HTTPException(status_code=404, detail=f"Unknown hospital {hospital_id!r}")
+    changes: dict = {}
+    if body.specialists_on_shift is not None:
+        changes["specialists_on_shift"] = body.specialists_on_shift
+    if body.ed_saturation is not None:
+        changes["ed_saturation"] = body.ed_saturation
+    if body.diversion is not None:
+        try:
+            Diversion(body.diversion)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Unknown diversion {body.diversion!r}") from exc
+        changes["diversion"] = body.diversion
+    if body.diverted_categories is not None:
+        changes["diverted_categories"] = body.diverted_categories
+    state = _state()
+    state.simulation.report_hospital_status(hospital_id, changes)
+    return _hospital_view(state, hospital_id)
+
+
+@app.get("/transports")
+def list_transports() -> list[dict]:
+    # Simulation.transport_list() owns the row shape; the hub pushes the
+    # identical payload as "transport_list" on every change, so this route is
+    # now just the initial seed rather than something the UI has to re-poll.
+    return _state().simulation.transport_list()
+
+
+@app.post("/transports/batch", status_code=201)
+def start_batch(body: BatchStartRequest) -> dict:
+    state = _state()
+    patients = [(_build_patient(p), p.position) for p in body.patients]
+    started = state.simulation.start_batch(patients)
+    return {"transport_ids": started}
+
+
+@app.get("/transports/{transport_id}/candidates")
+def get_candidates(transport_id: str) -> list[dict]:
+    state = _state()
+    _require_transport_seen(state, transport_id)
+    return [_candidate_view(c) for c in state.simulation.dispatcher.candidates_of(transport_id)]
+
+
+@app.get("/policy")
+def get_policy() -> dict:
+    return {"policy": _state().simulation.dispatcher.policy.value}
+
+
+@app.post("/policy")
+def set_policy(body: PolicyRequest) -> dict:
+    try:
+        policy = Policy(body.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown policy mode {body.mode!r}") from exc
+    _state().simulation.dispatcher.set_policy(policy)
+    return {"policy": policy.value}
+
+
+@app.get("/invariant")
+def get_global_invariant() -> CheckResult:
+    """I1-I4 over the entire log — the most expensive read in the API, so
+    the result is memoized against the store's revision: repeated calls
+    while nothing new has been appended cost an integer compare."""
+    state = _state()
+    revision = state.store.revision
+    if state.invariant_cache is not None and state.invariant_cache[0] == revision:
+        return state.invariant_cache[1]
+    result = check(
+        state.store.replay(),
+        patients=state.simulation.dispatcher.known_patients(),
+        # No `hospitals=`: check() projects the roster from the log itself,
+        # including hospitals since decommissioned, so history is audited
+        # against the network as it was rather than as it is now.
+        saturation_limit=state.config.saturation_limit,
+    )
+    state.invariant_cache = (revision, result)
+    return result
 
 
 @app.get("/transports/{transport_id}")
@@ -163,8 +443,11 @@ def get_transport_invariant(transport_id: str) -> CheckResult:
 
 
 @app.post("/demo/preset/{name}")
-def demo_preset(name: str) -> dict[str, str]:
+def demo_preset(name: str) -> dict:
     state = _state()
+    if name in ALL_MULTI_PRESETS:
+        started = state.simulation.run_multi_preset(name)
+        return {"preset": name, "transport_ids": started}
     if name not in ALL_PRESETS:
         raise HTTPException(status_code=400, detail=f"Unknown preset {name!r}")
     _require_redirectable(state, DEMO_TRANSPORT_ID)
@@ -183,7 +466,14 @@ def demo_reset() -> dict[str, str]:
     # a few stray, ultimately harmless events after reset before settling;
     # a production system would track and cancel those handles explicitly.
     state.simulation = Simulation(state.clock, state.store, state.config)
+    _bootstrap_roster(state)
     state.hub.rebind_source(state.simulation)
+    # Memoized against store.revision, which clear() bumps — but drop it
+    # anyway rather than relying on that coupling from another module.
+    state.invariant_cache = None
+    # Clearing the log fires no events, so without this every connected
+    # browser keeps rendering the pre-reset world (see Hub.broadcast_reset).
+    state.hub.broadcast_reset()
     return {"status": "reset"}
 
 
@@ -246,7 +536,12 @@ def ai_explain(transport_id: str) -> dict:
 def ai_recommend(transport_id: str) -> dict:
     state = _state()
     _require_transport_seen(state, transport_id)
-    return ai.recommend(list(HOSPITALS), {}, {})
+    current_epoch = _transport_view(state, transport_id).current_epoch
+    raw_position = state.simulation.ambulance_view(transport_id) or {"progress": 0.0, "known_destination": None}
+    position = ai.AmbulancePosition(
+        progress=raw_position["progress"], known_destination=raw_position["known_destination"]
+    )
+    return ai.recommend(transport_id, current_epoch, HOSPITALS, TRANSPORT.patient, position)
 
 
 # -- live updates ------------------------------------------------------------

@@ -4,13 +4,24 @@ between calls or reaches into a live Dispatcher/Facility.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence
 
-from app.dispatcher import DispatcherStatus
+from app.dispatcher_status import DispatcherStatus
 from app.events import Event, EventType
 from app.messages import FacilityState
+from app.models import (
+    BedType,
+    ConditionCategory,
+    Diversion,
+    Hospital,
+    HospitalStatus,
+    Need,
+    Patient,
+    Specialist,
+    hospital_from_payload,
+)
 
 
 class TransportViewStatus(str, Enum):
@@ -174,3 +185,191 @@ def _project_facilities(
         stale = facility.state in (FacilityState.ARMED, FacilityState.ACTIVE) and not in_current_plan
         views[(facility_id, transport_id)] = FacilityView(state=facility.state, epoch=facility.epoch, stale=stale)
     return views
+
+
+# -- Phase 12: the bed ledger (multi-hospital capacity extension) -----------
+# Pure, same spirit as project()/check() above: replays BedReserved/
+# BedReleased/BedOccupied and derives, per hospital, which transports
+# currently hold a reservation or occupancy in each bed type. A ventilator
+# hold is not in these events' payload (Need.VENTILATOR is a static patient
+# fact, not something the bus carries) — `patients` supplies it once, here,
+# rather than smuggling it onto every BedReserved payload.
+
+
+@dataclass(frozen=True)
+class HospitalLedgerView:
+    hospital_id: str
+    reserved: dict[BedType, frozenset[str]] = field(default_factory=dict)
+    occupied: dict[BedType, frozenset[str]] = field(default_factory=dict)
+    ventilator_holders: frozenset[str] = frozenset()
+
+
+def empty_ledger_view(hospital_id: str) -> HospitalLedgerView:
+    """What project_ledger(...) would produce for a hospital with no
+    BedReserved/BedReleased/BedOccupied events yet — callers that look a
+    hospital_id up in project_ledger's result dict and may not find one
+    (nothing has happened there) use this instead of special-casing a
+    missing key."""
+    return HospitalLedgerView(hospital_id=hospital_id)
+
+
+@dataclass
+class _MutableLedger:
+    reserved: dict[BedType, set[str]] = field(default_factory=dict)
+    occupied: dict[BedType, set[str]] = field(default_factory=dict)
+    ventilator_holders: set[str] = field(default_factory=set)
+
+
+def project_ledger(events: list[Event], patients: dict[str, Patient]) -> dict[str, HospitalLedgerView]:
+    mutable: dict[str, _MutableLedger] = {}
+    for event in events:
+        if event.type is EventType.BED_RESERVED:
+            _apply_bed_reserved(mutable, event, patients)
+        elif event.type is EventType.BED_RELEASED:
+            _apply_bed_released(mutable, event)
+        elif event.type is EventType.BED_OCCUPIED:
+            _apply_bed_occupied(mutable, event)
+
+    return {
+        hospital_id: HospitalLedgerView(
+            hospital_id=hospital_id,
+            reserved={bed_type: frozenset(ids) for bed_type, ids in ledger.reserved.items()},
+            occupied={bed_type: frozenset(ids) for bed_type, ids in ledger.occupied.items()},
+            ventilator_holders=frozenset(ledger.ventilator_holders),
+        )
+        for hospital_id, ledger in mutable.items()
+    }
+
+
+def _apply_bed_reserved(mutable: dict[str, _MutableLedger], event: Event, patients: dict[str, Patient]) -> None:
+    hospital_id = event.payload["hospital_id"]
+    transport_id = event.payload["transport_id"]
+    bed_type = BedType(event.payload["bed_type"])
+    ledger = mutable.setdefault(hospital_id, _MutableLedger())
+    ledger.reserved.setdefault(bed_type, set()).add(transport_id)
+    patient = patients.get(transport_id)
+    if patient is not None and Need.VENTILATOR in patient.needs:
+        ledger.ventilator_holders.add(transport_id)
+
+
+def _apply_bed_released(mutable: dict[str, _MutableLedger], event: Event) -> None:
+    hospital_id = event.payload["hospital_id"]
+    transport_id = event.payload["transport_id"]
+    ledger = mutable.setdefault(hospital_id, _MutableLedger())
+    for ids in ledger.reserved.values():
+        ids.discard(transport_id)
+    ledger.ventilator_holders.discard(transport_id)
+
+
+def _apply_bed_occupied(mutable: dict[str, _MutableLedger], event: Event) -> None:
+    # R19: moves a transport from reserved to occupied. If no reservation
+    # actually existed, this still records the occupancy — the ledger is a
+    # passive replay, not a validator; a missing reservation is checker.py's
+    # I3 to flag, not something to silently correct here.
+    hospital_id = event.payload["hospital_id"]
+    transport_id = event.payload["transport_id"]
+    bed_type = BedType(event.payload["bed_type"])
+    ledger = mutable.setdefault(hospital_id, _MutableLedger())
+    for ids in ledger.reserved.values():
+        ids.discard(transport_id)
+    ledger.occupied.setdefault(bed_type, set()).add(transport_id)
+
+
+@dataclass(frozen=True)
+class HospitalRoster:
+    """What replaying the roster events produces.
+
+    `active` is the network as it stands now. `known` also holds every
+    hospital that has ever been registered, including decommissioned ones,
+    at its last-registered configuration — the checker needs those: it
+    re-runs accept() over historical events to verify I4, and judging a past
+    acceptance against a roster that no longer contains the hospital would
+    turn a perfectly valid decision into a phantom violation."""
+
+    active: dict[str, Hospital] = field(default_factory=dict)
+    known: dict[str, Hospital] = field(default_factory=dict)
+
+
+def project_hospitals(events: Sequence[Event]) -> HospitalRoster:
+    """Pure: the hospital roster is a fold over the log, exactly like
+    TransportView and the bed ledger. Nothing else may be a source of truth
+    for which hospitals exist.
+
+    Roster events carry the hospital id in `transport_id` rather than a
+    dedicated column — the events table declares it NOT NULL and predates
+    hospital-scoped events, so HospitalStatusChanged and BedsReported already
+    use it that way. Following the same convention keeps this a pure addition
+    with no migration; `facility_id` carries the same id for readability.
+    """
+    active: dict[str, Hospital] = {}
+    known: dict[str, Hospital] = {}
+    for event in events:
+        if event.type is EventType.HOSPITAL_REGISTERED:
+            hospital = hospital_from_payload(event.payload)
+            active[hospital.id] = hospital
+            known[hospital.id] = hospital
+        elif event.type is EventType.HOSPITAL_UPDATED:
+            hospital = hospital_from_payload(event.payload)
+            known[hospital.id] = hospital
+            # An update to a decommissioned hospital records the new config
+            # without resurrecting it; re-registering is what brings one back.
+            if hospital.id in active:
+                active[hospital.id] = hospital
+        elif event.type is EventType.HOSPITAL_DECOMMISSIONED:
+            active.pop(event.payload.get("hospital_id") or event.transport_id, None)
+    return HospitalRoster(active=active, known=known)
+
+
+def free(view: HospitalLedgerView, status: HospitalStatus, bed_type: BedType) -> int:
+    used = len(view.reserved.get(bed_type, frozenset())) + len(view.occupied.get(bed_type, frozenset()))
+    return status.beds_total.get(bed_type, 0) - used
+
+
+def load(view: HospitalLedgerView, status: HospitalStatus) -> float:
+    total_beds = sum(status.beds_total.values())
+    if total_beds <= 0:
+        return 0.0
+    used = sum(
+        len(view.reserved.get(bed_type, frozenset())) + len(view.occupied.get(bed_type, frozenset()))
+        for bed_type in status.beds_total
+    )
+    return used / total_beds
+
+
+def ventilators_free(view: HospitalLedgerView, status: HospitalStatus) -> int:
+    return status.ventilators_total - len(view.ventilator_holders)
+
+
+# -- Phase 14 (F3): live HospitalStatus, replayed the same way as everything
+# else — apply_status_event() is pure (old status + one event -> new
+# status), so a Facility's live status is always "whatever replaying every
+# HospitalStatusChanged/BedsReported it's seen produces", never separately
+# mutated state that could drift from the log.
+
+
+def apply_status_event(status: HospitalStatus, event: Event) -> HospitalStatus:
+    if event.type is EventType.HOSPITAL_STATUS_CHANGED:
+        return replace(status, **_decode_status_changes(event.payload))
+    if event.type is EventType.BEDS_REPORTED:
+        bed_type = BedType(event.payload["bed_type"])
+        beds_total = dict(status.beds_total)
+        beds_total[bed_type] = event.payload["total"]
+        return replace(status, beds_total=beds_total)
+    return status
+
+
+def _decode_status_changes(payload: dict) -> dict:
+    """HospitalStatusChanged's payload is a partial HospitalStatus — only
+    the fields actually changing, JSON-safe (the API layer, Phase 17,
+    builds this from POST /hospitals/{id}/status). Decodes just the keys
+    present back into the real enum/frozenset types."""
+    changes: dict = {}
+    if "specialists_on_shift" in payload:
+        changes["specialists_on_shift"] = frozenset(Specialist(s) for s in payload["specialists_on_shift"])
+    if "ed_saturation" in payload:
+        changes["ed_saturation"] = float(payload["ed_saturation"])
+    if "diversion" in payload:
+        changes["diversion"] = Diversion(payload["diversion"])
+    if "diverted_categories" in payload:
+        changes["diverted_categories"] = frozenset(ConditionCategory(c) for c in payload["diverted_categories"])
+    return changes
