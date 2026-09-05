@@ -66,14 +66,22 @@ DELAYED_OLD_FACILITY = Preset(
 OUT_OF_ORDER_ACK = Preset(
     name="OUT_OF_ORDER_ACK",
     delays=(
-        # First redirect A -> B (epoch 2): fast and unremarkable...
-        100, 100, 100, 100, 100, 100, 100, 100,
-        450,  # ...except B's activate-APPLIED(v2), which is held back...
-        100,  # ...while the withdraw-APPLIED for the abandoned facility is fast.
+        # First redirect A -> B (epoch 2): fast through PREPARE/NOTICE/
+        # READY/ACTIVATE_AT/RECEIVED/WITHDRAW_AT...
+        100, 100, 100, 100, 100, 100, 100,
+        # ...then every late-stage epoch-2 ack (A's WITHDRAW_AT-RECEIVED,
+        # A's WITHDRAW-APPLIED, B's ACTIVATE_AT-APPLIED) held back as a
+        # block. Their exact relative order isn't fully pinned down by the
+        # spec and can shift slightly under a real (non-simulated) clock —
+        # delaying the whole block, not just one guessed position, is what
+        # actually guarantees B's activate-APPLIED(v2) is still in flight
+        # when the second redirect starts, regardless of which of the
+        # three lands where.
+        500, 500, 500,
         # Second redirect B -> C (epoch 3), fired later by the scenario:
-        # fast enough that C's READY(v3) reaches the dispatcher first —
-        # B's APPLIED(v2) above is still in flight and arrives after it,
-        # by which point it is fenced as stale (R2).
+        # fast enough that C's READY(v3) reaches the dispatcher well before
+        # the held-back block above finally arrives, so B's APPLIED(v2) is
+        # fenced as stale (R2) once it does.
         50, 50, 50, 50, 50, 50, 50, 50,
     ),
     duplicate_rate=0.0,

@@ -3,8 +3,9 @@ client. It subscribes once to the EventStore and, on each new event,
 re-derives the projection and invariant check fresh from the full log —
 the same pure functions a client could run itself, computed once here
 instead of once per browser tab. It also relays a live snapshot of the
-bus's in-flight messages, since that isn't something the event log alone
-can reconstruct (it only shows what has already happened).
+bus's in-flight messages and the ambulance's own progress/known_destination,
+neither of which the event log alone can reconstruct (both are live state,
+not history).
 """
 from __future__ import annotations
 
@@ -19,8 +20,13 @@ from app.events import Event, EventStore
 from app.projection import project
 
 
-class InFlightSource(Protocol):
+class HubSource(Protocol):
+    """What the hub needs beyond the event log — Simulation satisfies this
+    structurally, no inheritance required."""
+
     def in_flight(self) -> list[dict]: ...
+
+    def ambulance_view(self, transport_id: str) -> Optional[dict]: ...
 
 
 class Hub:
@@ -28,12 +34,12 @@ class Hub:
         self._connections: set[WebSocket] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._store: Optional[EventStore] = None
-        self._in_flight_source: Optional[InFlightSource] = None
+        self._source: Optional[HubSource] = None
 
-    def configure(self, loop: asyncio.AbstractEventLoop, store: EventStore, in_flight_source: InFlightSource) -> None:
+    def configure(self, loop: asyncio.AbstractEventLoop, store: EventStore, source: HubSource) -> None:
         self._loop = loop
         self._store = store
-        self._in_flight_source = in_flight_source
+        self._source = source
         store.subscribe(self._on_event)
 
     async def connect(self, websocket: WebSocket) -> None:
@@ -43,12 +49,12 @@ class Hub:
     def disconnect(self, websocket: WebSocket) -> None:
         self._connections.discard(websocket)
 
-    def rebind_in_flight_source(self, source: InFlightSource) -> None:
+    def rebind_source(self, source: HubSource) -> None:
         """Called by /demo/reset after it replaces the Simulation instance —
         the store stays the same (just cleared) so its subscription is
-        still valid, but the old in_flight_source would otherwise keep
-        answering for a Bus nothing points to anymore."""
-        self._in_flight_source = source
+        still valid, but the old source would otherwise keep answering for
+        a Bus/ambulance set nothing points to anymore."""
+        self._source = source
 
     def broadcast(self, message: dict[str, Any]) -> None:
         """Safe to call from any context — EventStore.subscribe() calls
@@ -93,8 +99,11 @@ class Hub:
 
         self.broadcast({"kind": "invariant", "transport_id": event.transport_id, "result": result})
 
-        if self._in_flight_source is not None:
-            self.broadcast({"kind": "in_flight", "messages": self._in_flight_source.in_flight()})
+        if self._source is not None:
+            self.broadcast({"kind": "in_flight", "messages": self._source.in_flight()})
+            ambulance = self._source.ambulance_view(event.transport_id)
+            if ambulance is not None:
+                self.broadcast({"kind": "ambulance", "transport_id": event.transport_id, **ambulance})
 
     def broadcast_fuzz(self, summary: dict[str, Any]) -> None:
         self.broadcast({"kind": "fuzz", **summary})

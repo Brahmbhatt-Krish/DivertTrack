@@ -113,6 +113,12 @@ class Simulation:
     def in_flight(self) -> list[dict]:
         return self._bus.in_flight()
 
+    def ambulance_view(self, transport_id: str) -> Optional[dict]:
+        ambulance = self._ambulances.get(transport_id)
+        if ambulance is None:
+            return None
+        return {"known_destination": ambulance.known_destination, "progress": ambulance.progress}
+
     def run_preset(self, transport_id: str, name: str) -> None:
         preset = ALL_PRESETS[name]
         self._bus.load_preset(preset.delays, preset.duplicate_rate)

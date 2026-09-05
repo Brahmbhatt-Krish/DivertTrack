@@ -18,6 +18,15 @@ from app.config import Config
 from app.events import Event, EventStore, EventType
 from app.messages import Ack, AckType, ActionType, Command
 
+# Pure scheduling margin for the dispatcher's own cutover-apply timer — see
+# _schedule_cutover's comment on record.cutover_timer for why a real clock
+# needs this even though FakeClock (and every automated test) never does.
+# 25ms was enough in an isolated asyncio.run() with nothing else competing
+# for the loop, but not under a real uvicorn server also handling HTTP
+# requests, WebSocket broadcasts and --reload's file watching — all of
+# that adds real scheduling jitter well beyond floating-point noise.
+_DISPATCHER_SETTLE_MS = 150
+
 
 class DispatcherStatus(str, Enum):
     STARTING = "STARTING"
@@ -223,7 +232,26 @@ class Dispatcher:
             transport_id, record, record.pending_destination, record.pending_epoch,
             ActionType.ACTIVATE_AT, effective_at_ms=cutover_at,
         )
-        record.cutover_timer = self._clock.schedule(cutover_at - t0, lambda: self._apply_cutover(transport_id, record))
+        # _apply_cutover flips current_destination on this timer alone — it
+        # does not wait for any ack (that's the whole point: it must stay
+        # correct even if the pending facility's own APPLIED ack is never
+        # seen, e.g. E7's out-of-order case). The pending facility applies
+        # its OWN ACTIVATE_AT (effective_at=cutover_at, above) on a
+        # *separate* timer it schedules independently once the command
+        # arrives. Under FakeClock both are ordered deterministically
+        # (E23's insertion-order tie-break, since this timer is inserted
+        # first) — a real clock gives no such guarantee between two
+        # independently-computed timers aimed at the same nominal instant,
+        # and Event.ts_ms's own integer-millisecond rounding means their
+        # *computed* targets can differ by a millisecond or two even when
+        # both are "correct". _DISPATCHER_SETTLE_MS (much larger than that)
+        # is pure margin ensuring this bookkeeping update always lands
+        # safely after the pending facility has actually activated — see
+        # _on_activate_received for the matching margin on the old
+        # facility's withdrawal, which must land safely after *this*.
+        record.cutover_timer = self._clock.schedule(
+            cutover_at - t0 + _DISPATCHER_SETTLE_MS, lambda: self._apply_cutover(transport_id, record)
+        )
         receipt_deadline_ms = t0 + 2 * self._config.d_max_ms + self._config.guard_ms
         record.receipt_deadline_timer = self._clock.schedule(
             receipt_deadline_ms - t0, lambda: self._on_receipt_deadline(transport_id, record)
@@ -236,9 +264,17 @@ class Dispatcher:
         if record.withdraw_sent:
             return  # ack dedup already guards this, but never send it twice
         self._cancel_timer(record, "receipt_deadline_timer")
+        # Effective at cutover_at + 2*settle, not cutover_at: the spec's own
+        # safety argument allows the old facility to withdraw "at the same
+        # instant or later" — never earlier. One settle margin (matching
+        # _schedule_cutover's cutover_timer) puts this safely after the
+        # dispatcher's own bookkeeping update, which is itself one margin
+        # after the new facility's real activation — a strict, non-racing
+        # order: new facility active, then current_destination flips, then
+        # (only then) the old facility actually stands down.
         command_id = self._send(
             transport_id, record, record.current_destination, record.pending_epoch,
-            ActionType.WITHDRAW_AT, effective_at_ms=record.cutover_at,
+            ActionType.WITHDRAW_AT, effective_at_ms=record.cutover_at + 2 * _DISPATCHER_SETTLE_MS,
         )
         record.withdraw_sent = True
         self._log(transport_id, record.pending_epoch, EventType.WITHDRAW_SENT, {"command_id": command_id})

@@ -31,7 +31,7 @@ class AppState:
     """Everything the routes need. /demo/reset replaces this object
     wholesale (a fresh EventStore + Simulation) rather than mutating one in
     place, so nothing can accidentally hold a stale reference across a reset
-    except the Hub, which is told explicitly (rebind_in_flight_source)."""
+    except the Hub, which is told explicitly (rebind_source)."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -183,7 +183,7 @@ def demo_reset() -> dict[str, str]:
     # a few stray, ultimately harmless events after reset before settling;
     # a production system would track and cancel those handles explicitly.
     state.simulation = Simulation(state.clock, state.store, state.config)
-    state.hub.rebind_in_flight_source(state.simulation)
+    state.hub.rebind_source(state.simulation)
     return {"status": "reset"}
 
 
