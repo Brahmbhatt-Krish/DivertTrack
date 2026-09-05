@@ -119,6 +119,13 @@ class EventStore:
     def subscribe(self, fn: Callable[[Event], None]) -> None:
         self._subscribers.append(fn)
 
+    def clear(self) -> None:
+        """Wipes the log — used by POST /demo/reset. Subscribers are left
+        registered; seq is not restarted, since nothing depends on it
+        beginning at 1 after a reset, only on staying monotonic."""
+        self._conn.execute("DELETE FROM events")
+        self._conn.commit()
+
 
 def _row_to_event(row: tuple) -> Event:
     seq, transport_id, epoch, ts_ms, type_value, facility_id, payload = row

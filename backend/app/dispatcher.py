@@ -88,6 +88,13 @@ class Dispatcher:
     def queued_redirect_of(self, transport_id: str) -> Optional[str]:
         return self._require_transport(transport_id).queued_redirect
 
+    def is_known(self, transport_id: str) -> bool:
+        """Whether this dispatcher instance has this transport in its live
+        cache — false for a transport that only exists in event history
+        from before a restart (E21): main.py uses this to tell a genuinely
+        in-progress transition apart from an orphaned, INTERRUPTED one."""
+        return transport_id in self._transports
+
     # -- R10: start ------------------------------------------------------
 
     def start(self, transport_id: str, destination: str) -> None:
@@ -367,7 +374,12 @@ class Dispatcher:
         record.ready_received = False
         record.notice_applied = False
         record.status = DispatcherStatus.STARTING
-        self._log(transport_id, epoch, EventType.REDIRECT_REQUESTED, {"target": target})
+        # still_starting distinguishes this from _begin_redirect's identical
+        # event type — projection.py replays purely from events and can't
+        # otherwise tell "redirect while starting" (stay STARTING) apart
+        # from a normal redirect (go PREPARING); see its REDIRECT_REQUESTED
+        # handler.
+        self._log(transport_id, epoch, EventType.REDIRECT_REQUESTED, {"target": target, "still_starting": True})
         record.prepare_command_id = self._send(transport_id, record, target, epoch, ActionType.PREPARE)
         record.notice_command_id = self._send(transport_id, record, target, epoch, ActionType.REDIRECT_NOTICE)
 

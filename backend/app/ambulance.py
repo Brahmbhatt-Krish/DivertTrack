@@ -66,6 +66,12 @@ class Ambulance:
         worst_case_redirect_ms = config.prep_ms + 5 * config.d_max_ms + config.guard_ms
         self._ticks_per_leg = max(1, round(2 * worst_case_redirect_ms / config.tick_ms))
 
+    def set_manual_confirm(self, enabled: bool) -> None:
+        """Runtime toggle for the demo's manual-mode control (Phase 9),
+        mirroring Facility.set_manual_ready — this ambulance is constructed
+        once per transport, before the operator has chosen a mode for it."""
+        self._manual_confirm = enabled
+
     # -- the fence (spec: "same fence as facilities, steps 2-3") -------------
 
     def receive_command(self, command: Command) -> None:

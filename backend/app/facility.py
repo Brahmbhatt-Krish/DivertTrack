@@ -81,6 +81,14 @@ class Facility:
     def highest_applied_epoch_of(self, transport_id: str) -> int:
         return self._record_for(transport_id).highest_applied_epoch
 
+    def set_manual_ready(self, enabled: bool) -> None:
+        """Runtime toggle for the demo's manual-mode control (Phase 9) —
+        Phase 2's manual_ready was construction-time only, which the demo
+        can't use since all three Facility instances are built once, before
+        the operator has said anything about how they want to run this
+        transport's scenario."""
+        self._manual_ready = enabled
+
     # -- the pipeline (spec: "run in this exact order on every command") ----
 
     def receive_command(self, command: Command) -> None:

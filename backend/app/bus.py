@@ -44,6 +44,7 @@ class Bus:
         self._dispatcher_handler: Optional[Callable[[Ack], None]] = None
         self._held: set[str] = set()
         self._parked: dict[str, list[Command | Ack]] = {}
+        self._in_flight: dict[str, dict] = {}
 
         if strict_bound and max_delay_ms > d_max_ms:
             raise ValueError(
@@ -101,12 +102,31 @@ class Bus:
         delay = self._next_delay()
         expected_arrival_ms = self._clock.now_ms() + delay
         self._log_command_sent(message, expected_arrival_ms)
+        kind = "command" if isinstance(message, Command) else "ack"
+        label = message.action.value if isinstance(message, Command) else message.ack_type.value
         if message.command_id in self._held:
             self._parked.setdefault(message.command_id, []).append(message)
+            self._in_flight[message.command_id] = {
+                "command_id": message.command_id, "kind": kind, "label": label,
+                "held": True, "expected_arrival_ms": None,
+            }
         else:
+            self._in_flight[message.command_id] = {
+                "command_id": message.command_id, "kind": kind, "label": label,
+                "held": False, "expected_arrival_ms": expected_arrival_ms,
+            }
             self._clock.schedule(delay, lambda: self._deliver(message))
 
+    def in_flight(self) -> list[dict]:
+        """A live snapshot for the demo UI's in-flight list (Phase 9) — not
+        derivable from the event log alone, which only shows the past. A
+        message sent twice via duplicate_rate collapses to one entry here
+        (both share a command_id); that's a display nuance, not a
+        correctness issue — the log still records both deliveries."""
+        return list(self._in_flight.values())
+
     def _deliver(self, message: Command | Ack) -> None:
+        self._in_flight.pop(message.command_id, None)
         self._log_message_delivered(message)
         if isinstance(message, Command):
             # REDIRECT_NOTICE always goes to the ambulance for this

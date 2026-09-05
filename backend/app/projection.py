@@ -104,7 +104,12 @@ def _apply_transport_event(state: _MutableTransport, event: Event) -> None:
     elif event.type is EventType.REDIRECT_REQUESTED:
         state.pending_destination = event.payload["target"]
         state.pending_epoch = event.epoch
-        state.status = DispatcherStatus.PREPARING
+        # A redirect fired before start()'s own cutover ever applied stays
+        # STARTING (Dispatcher._redirect_before_first_activation) — every
+        # other redirect goes PREPARING (Dispatcher._begin_redirect).
+        state.status = (
+            DispatcherStatus.STARTING if event.payload.get("still_starting") else DispatcherStatus.PREPARING
+        )
     elif event.type is EventType.REDIRECT_QUEUED:
         state.queued_redirect = event.payload["target"]
     elif event.type is EventType.CUTOVER_SCHEDULED:
