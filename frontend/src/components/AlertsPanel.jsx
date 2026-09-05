@@ -18,7 +18,10 @@ function AlertsPanel({ alerts }) {
         </CardTitle>
       </CardHeader>
 
-      <CardContent className="px-4">
+      {/* Capped and scrolled, like Timeline and Transports. Uncapped, this grew
+          with every alert until it was the tallest thing on the page — and it
+          shares a grid row with the map, so it dragged that row with it. */}
+      <CardContent className="max-h-[352px] overflow-y-auto px-4">
         {recent.length === 0 ? (
           <p className="text-xs text-muted-foreground">No alerts yet.</p>
         ) : (

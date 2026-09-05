@@ -35,8 +35,14 @@ function RegionMap({ hospitals, ambulances }) {
           <span className="text-xs text-muted-foreground">40 × 40 km</span>
         </div>
       </CardHeader>
-      <CardContent className="px-4">
-      <svg viewBox={`0 0 ${SIZE_PX} ${SIZE_PX}`} className="w-full max-w-md rounded-lg border border-border bg-muted/30">
+      <CardContent className="flex flex-col items-center px-4">
+      {/* The map is square, so its height follows its width — left-aligned at
+          full card width it both left a dead column beside it and made this
+          the tallest card on the page. Centred and capped instead. */}
+      <svg
+        viewBox={`0 0 ${SIZE_PX} ${SIZE_PX}`}
+        className="aspect-square w-full max-w-[320px] rounded-lg border border-border bg-muted/30"
+      >
         {hospitalList.map((h) => {
           const [x, y] = h.location || [0, 0];
           const r = 6 + (h.load || 0) * 14;
@@ -84,7 +90,7 @@ function RegionMap({ hospitals, ambulances }) {
         })}
       </svg>
 
-      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+      <div className="mt-3 flex flex-wrap items-center justify-center gap-x-3.5 gap-y-1 text-xs text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-primary" /> open
         </span>

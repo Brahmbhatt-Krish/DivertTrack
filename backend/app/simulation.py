@@ -75,6 +75,9 @@ class Simulation:
             on_no_destination=self._stand_down_ambulance,
         )
         self._bus.register_dispatcher(self._dispatcher.on_ack)
+        # How many times each multi-preset has been run, so repeat clicks
+        # get fresh transport ids instead of colliding (see run_multi_preset).
+        self._preset_runs: dict[str, int] = {}
 
     # -- read-only access for callers that need it (tests, main.py) --------
 
@@ -180,6 +183,7 @@ class Simulation:
         """Re-configure a hospital in place (capabilities, name, location).
         The Facility keeps its identity and its live status — only the static
         record it was built from changes."""
+        previous_status = self._dispatcher.hospital_status_of(hospital.id)
         self._hospitals[hospital.id] = hospital
         facility = self._facilities.get(hospital.id)
         if facility is not None:
@@ -192,6 +196,19 @@ class Simulation:
                 payload=hospital_to_payload(hospital),
             )
         )
+        # Bed counts live on the event-sourced HospitalStatus, not on the
+        # static Hospital record — free()/load() and every acceptance check
+        # read the status. Updating only the record left the update silently
+        # ineffective: the API returned 200 and the bed counts never moved.
+        # Route the change through the same BedsReported path a hospital uses
+        # to report beds itself, so capacity rebalance (R18) also runs.
+        if previous_status is not None:
+            for bed_type, total in hospital.beds_total.items():
+                if previous_status.beds_total.get(bed_type) != total:
+                    self.report_beds(hospital.id, bed_type, total)
+            for bed_type in previous_status.beds_total:
+                if bed_type not in hospital.beds_total:
+                    self.report_beds(hospital.id, bed_type, 0)
 
     def decommission_hospital(self, hospital_id: str, reason: str = "decommissioned") -> None:
         """Retire a hospital that may have ambulances already driving to it.
@@ -275,9 +292,19 @@ class Simulation:
                 )
         from app.dispatcher import NotEligible
 
+        # Preset transport ids used to be derived from the preset name and the
+        # patient index alone, so a second click reused the first run's ids and
+        # the dispatcher rejected them as already-started (a 500 on every run
+        # after the first). A per-simulation run counter makes each click a
+        # fresh set. It is omitted on run 1 so the ids a first run produces —
+        # and every test that asserts on them — are unchanged.
+        self._preset_runs[name] = self._preset_runs.get(name, 0) + 1
+        run = self._preset_runs[name]
+        suffix = "" if run == 1 else f"-r{run}"
+
         started: list[str] = []
         for index, transport in enumerate(preset.transports):
-            transport_id = f"{name}-{transport.patient.id}-{index}"
+            transport_id = f"{name}{suffix}-{transport.patient.id}-{index}"
             try:
                 self.start_capacity_aware(transport_id, transport.patient, transport.position, transport.target)
             except NotEligible:

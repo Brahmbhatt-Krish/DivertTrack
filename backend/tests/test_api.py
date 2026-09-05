@@ -543,3 +543,36 @@ def test_decommissioning_is_visible_on_the_websocket_as_a_roster_push(client: Te
     rosters = [sub for sub in message["messages"] if sub["kind"] == "roster"]
     assert rosters, "a roster change must push the whole roster"
     assert "Hospital_3" not in [h["id"] for h in rosters[-1]["hospitals"]]
+
+
+def test_updating_a_hospital_actually_changes_its_bed_capacity(client: TestClient) -> None:
+    """Bed counts live on the event-sourced HospitalStatus, not the static
+    Hospital record, so updating only the record left PUT silently
+    ineffective — it returned 200 and the capacity never moved."""
+    body = {
+        "id": "Hospital_4", "name": "Westfield Community", "location": [32.0, 32.0],
+        "beds_total": {"GENERAL": 99, "ICU": 7},
+        "capabilities": ["TRAUMA_L3", "CT_SCAN"], "ventilators_total": 3,
+    }
+    response = client.put("/hospitals/Hospital_4", json=body)
+    assert response.status_code == 200
+    assert response.json()["beds_total"] == {"GENERAL": 99, "ICU": 7}
+    live = [h for h in client.get("/hospitals").json() if h["id"] == "Hospital_4"][0]
+    assert live["beds_total"] == {"GENERAL": 99, "ICU": 7}
+    assert live["free"]["GENERAL"] == 99
+
+
+def test_a_new_hospital_cannot_take_over_a_legacy_facility_id(client: TestClient) -> None:
+    """Hospital_A/B/C are plain demo facilities with no accept(), sharing the
+    same id space and message bus. Registering over one produced a hospital
+    that ranked and won like any other but admitted patients no capacity
+    check had ever approved."""
+    response = client.post(
+        "/hospitals",
+        json={
+            "id": "Hospital_A", "name": "Collision", "location": [5.0, 5.0],
+            "beds_total": {"GENERAL": 5}, "capabilities": [], "ventilators_total": 0,
+        },
+    )
+    assert response.status_code == 409
+    assert "Hospital_A" not in [h["id"] for h in client.get("/hospitals").json()]

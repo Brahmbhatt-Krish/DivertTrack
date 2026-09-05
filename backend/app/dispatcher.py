@@ -527,6 +527,15 @@ class Dispatcher:
         per candidate and a no-longer-eligible one is skipped rather than
         reserved. (Reserving on a failed decision used to crash here:
         Decision.bed_type is None when it isn't accepted.)"""
+        # Whatever candidate we were on is being abandoned. It has already
+        # been sent a PREPARE, so it is at least ARMED — and if its READY came
+        # back during a start, it has an ACTIVATE_AT in flight and will go
+        # ACTIVE regardless of us moving on. Left un-withdrawn it becomes an
+        # orphaned facility: active for a transport whose dispatcher now
+        # believes it is somewhere else entirely, which is a direct I1
+        # (ZERO_ACTIVE) failure once the new candidate's cutover applies.
+        self._stand_down_abandoned_candidate(transport_id, record)
+
         while record.candidate_queue:
             target = record.candidate_queue.pop(0)
             record.candidates_tried.append(target)
@@ -768,6 +777,26 @@ class Dispatcher:
             self._abort(transport_id, record)
             record.status = DispatcherStatus.NO_ACCEPTING_FACILITY
 
+    def _stand_down_abandoned_candidate(self, transport_id: str, record: _TransportState) -> None:
+        """Withdraw the candidate we are walking away from, and retire the
+        activation bookkeeping that belonged to it.
+
+        WITHDRAW is safe in every state the candidate can be in: IDLE (it
+        declined) ignores it, ARMED stands down, ACTIVE stands down. Clearing
+        activate_command_id matters just as much — otherwise that candidate's
+        late ACTIVATE_AT ack is still routed as though this transport had a
+        live transition to it."""
+        previous = record.pending_destination
+        if previous is None:
+            return
+        if record.pending_epoch is not None:
+            self._send(transport_id, record, previous, record.pending_epoch, ActionType.WITHDRAW)
+        record.pending_destination = None
+        record.activate_command_id = None
+        record.cutover_at = None
+        record.withdraw_sent = False
+        self._cancel_timer(record, "receipt_deadline_timer")
+
     def _stop_driving_to_released_candidate(self, transport_id: str, record: _TransportState) -> None:
         """Park the ambulance the instant a candidate it was driving toward
         loses its reservation. Whatever comes next (the next candidate, an
@@ -790,7 +819,20 @@ class Dispatcher:
         (ARRIVED_WITHOUT_RESERVATION), which E33 says the dispatcher must
         never produce."""
         self._cancel_timers(record)
-        record.pending_destination = None
+        # The abandoned candidate may already be ARMED — or ACTIVE, if its
+        # ACTIVATE_AT landed before capacity moved and displaced this
+        # transport. Clearing our own bookkeeping without telling it leaves it
+        # holding a transport nothing owns any more: an orphaned facility that
+        # no later redirect will ever withdraw, which is a live I1 hazard.
+        # WITHDRAW is safe whatever state it is in — a candidate that merely
+        # declined fences it and ignores it.
+        abandoned = record.pending_destination
+        if abandoned is not None and record.pending_epoch is not None:
+            self._send(transport_id, record, abandoned, record.pending_epoch, ActionType.WITHDRAW)
+        # Retire the whole transition, not just pending_destination: a late
+        # ack for its ACTIVATE_AT would otherwise still match
+        # activate_command_id and be routed as if a redirect were in flight.
+        self._clear_pending(record)
         record.status = DispatcherStatus.NO_ACCEPTING_FACILITY
         if self._on_no_destination is not None:
             # Everything issued up to and including this seq belongs to the
@@ -847,6 +889,23 @@ class Dispatcher:
     def _on_activate_received(self, transport_id: str, record: _TransportState) -> None:
         if record.withdraw_sent:
             return  # ack dedup already guards this, but never send it twice
+        if record.cutover_at is None or record.pending_epoch is None:
+            # Defence in depth only. The ack that reaches here is matched on
+            # activate_command_id, and every path that abandons a transition
+            # now clears that id (_clear_pending, via give-up and
+            # _stand_down_abandoned_candidate) — so a concluded transition's
+            # ack no longer routes here at all.
+            #
+            # Deliberately NOT guarded on current_destination: when a cutover
+            # timer fires before this ack arrives (which happens whenever the
+            # delay bound is exceeded, E25), the transition has *completed*
+            # rather than been abandoned, and the withdraw is still owed.
+            # Guarding it away there stranded the old facility active.
+            self._log(
+                transport_id, record.current_epoch, EventType.STALE_IGNORED,
+                {"command_id": record.activate_command_id, "reason": "transition_already_concluded"},
+            )
+            return
         self._cancel_timer(record, "receipt_deadline_timer")
         # Effective at cutover_at + 2*settle, not cutover_at: the spec's own
         # safety argument allows the old facility to withdraw "at the same

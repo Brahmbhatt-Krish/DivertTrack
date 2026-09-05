@@ -20,9 +20,15 @@ import { cn } from "@/lib/utils";
 
 const DIVERSIONS = ["OPEN", "PARTIAL", "FULL"];
 
-function CapacityBar({ bedType, total, free, holders }) {
+function CapacityBar({ bedType, total, free, holders, diversion }) {
   const used = total - free;
   const pct = total > 0 ? Math.round((used / total) * 100) : 0;
+  // A hospital on diversion cannot take a patient however many beds are free,
+  // so a green "0/15" contradicts the FULL badge right above it. The rail and
+  // the count carry that state; the filled portion still shows true occupancy
+  // rather than being faked to 100%, which would claim beds are taken.
+  const blocked = diversion === "FULL";
+  const partial = diversion === "PARTIAL";
   // Who actually holds these beds. Reserved = held for an ambulance still en
   // route (releasable); occupied = a patient is in it.
   const reserved = holders?.reserved ?? [];
@@ -37,17 +43,29 @@ function CapacityBar({ bedType, total, free, holders }) {
   return (
     <div>
       <div className="flex items-center gap-2.5 text-xs">
-        <span className="w-20 shrink-0 text-muted-foreground">{bedType}</span>
-        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted" title={title || undefined}>
+        <span className={cn("w-20 shrink-0", blocked ? "text-danger" : "text-muted-foreground")}>{bedType}</span>
+        <div
+          className={cn(
+            "h-1.5 flex-1 overflow-hidden rounded-full",
+            blocked ? "bg-danger-soft ring-1 ring-inset ring-danger-border" : partial ? "bg-warning-soft" : "bg-muted",
+          )}
+          title={blocked ? `On full diversion — not accepting${title ? `
+${title}` : ""}` : title || undefined}
+        >
           <div
             className={cn(
               "h-1.5 rounded-full transition-all",
-              pct >= 100 ? "bg-danger" : pct >= 70 ? "bg-warning" : "bg-success",
+              blocked ? "bg-danger" : pct >= 100 ? "bg-danger" : pct >= 70 ? "bg-warning" : "bg-success",
             )}
             style={{ width: `${Math.min(100, pct)}%` }}
           />
         </div>
-        <span className="w-12 shrink-0 text-right font-mono text-muted-foreground">
+        <span
+          className={cn(
+            "w-12 shrink-0 text-right font-mono",
+            blocked ? "text-danger" : "text-muted-foreground",
+          )}
+        >
           {used}/{total}
         </span>
       </div>
@@ -386,6 +404,7 @@ function HospitalsPanel({ hospitals }) {
                     total={total}
                     free={h.free?.[bedType] ?? total}
                     holders={h.holders?.[bedType]}
+                    diversion={h.diversion}
                   />
                 ))}
 

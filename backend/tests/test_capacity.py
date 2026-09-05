@@ -239,3 +239,58 @@ def test_e33_a_stale_in_flight_notice_does_not_strand_an_ambulance() -> None:
         result = check(store.replay(), patients=sim.dispatcher.known_patients(), hospitals=hospitals)
         stranded = [v for v in result.violations if v.kind.value == "ARRIVED_WITHOUT_RESERVATION"]
         assert not stranded, stranded
+
+
+def test_an_abandoned_candidate_is_withdrawn_not_orphaned() -> None:
+    """Moving to the next candidate must stand the previous one down.
+
+    Regression. A candidate whose READY came back during a start has an
+    ACTIVATE_AT already crossing the bus. If capacity moves and displaces the
+    transport before that lands, the candidate still goes ACTIVE — and with no
+    WITHDRAW it stays ACTIVE for a transport whose dispatcher has since
+    committed elsewhere. The checker then sees the wrong facility active for
+    that transport: I1 ZERO_ACTIVE.
+
+    It also left activate_command_id set, so that candidate's late RECEIVED
+    ack was routed as a live redirect and crashed on a cutover_at of None.
+    """
+    import random as _random
+
+    from app.checker import check
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import BedType as _BedType
+    from app.models import Policy as _Policy
+    from app.seed import MULTI_HOSPITALS, random_patient
+    from app.simulation import Simulation
+
+    hospitals = {hospital.id: hospital for hospital in MULTI_HOSPITALS}
+    config = Config(
+        groq_api_key="", d_max_ms=200, guard_ms=50, ready_timeout_ms=1500, prep_ms=50,
+        tick_ms=100, db_path=":memory:", policy=_Policy.AUTO,
+    )
+
+    for trial in range(12):
+        rng = _random.Random(trial)
+        clock, store = _FakeClock(), _EventStore(":memory:")
+        sim = Simulation(clock, store, config, hospitals=hospitals)
+        sim.start_batch(
+            [(random_patient(rng, f"P{i}"), (rng.uniform(0, 40), rng.uniform(0, 40))) for i in range(20)]
+        )
+        # Capacity churn *while transports are mid-handshake* is what makes a
+        # candidate get abandoned after its ACTIVATE_AT has already been sent.
+        for step in range(6):
+            hospital_id = f"Hospital_{rng.randint(1, 6)}"
+            bed_type = rng.choice([_BedType.GENERAL, _BedType.ICU])
+            total = rng.randint(0, 3)
+            clock.schedule(
+                400 * (step + 1),
+                lambda h=hospital_id, b=bed_type, t=total: sim.report_beds(h, b, t),
+            )
+        clock.run_until_quiet()
+
+        result = check(store.replay(), patients=sim.dispatcher.known_patients())
+        handoff = [
+            v for v in result.violations if v.kind.value in ("ZERO_ACTIVE", "MULTI_ACTIVE")
+        ]
+        assert not handoff, f"trial {trial}: {handoff[:3]}"

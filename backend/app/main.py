@@ -283,8 +283,14 @@ def register_hospital(body: HospitalRequest) -> dict:
     dispatcher gets a status entry, a Facility is built, and its bus endpoint
     is registered, so it can accept a PREPARE on the very next redirect."""
     state = _state()
-    if body.id in state.simulation.hospitals:
-        raise HTTPException(status_code=409, detail=f"Hospital {body.id!r} already exists")
+    # Checked against facilities, not just the capacity-aware roster: the
+    # three legacy demo facilities (Hospital_A/B/C) share the same id space
+    # and the same message bus. Registering over one of them produced a
+    # hospital that ranked and won like any other but was backed by a plain
+    # facility with no accept() — it took patients no capacity check had
+    # ever approved.
+    if body.id in state.simulation.facilities:
+        raise HTTPException(status_code=409, detail=f"Facility {body.id!r} already exists")
     state.simulation.register_hospital(_build_hospital(body))
     return _hospital_view(state, body.id)
 

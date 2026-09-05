@@ -9,9 +9,10 @@ simulated, and the same core protocol runs identically under a fake,
 instantaneous test clock and a real wall-clock server.
 
 The base system (Phases 0-11) handles three fixed hospitals and one
-transport at a time. An extension on top (Phases 12-20) generalizes this to
-six hospitals with real bed capacity, many concurrent transports, and
-patients with medical needs a hospital may have to decline — see
+transport at a time. An extension on top (Phases 12-21) generalizes this to
+a hospital network with real bed capacity, many concurrent transports,
+patients with medical needs a hospital may have to decline, and a roster of
+hospitals that can be changed while transports are in the air — see
 "Beyond the PRD" below for why that extension exists and what it actually
 proves.
 
@@ -79,6 +80,19 @@ suite's assumptions). For a demo where handovers are visibly fast, set
 state change (`PREPARE` → `ARMED` → `ACTIVATE_AT` → `ACTIVE`, the old
 hospital's `WITHDRAWN`) is visible on screen rather than flashing past.
 
+Two separate knobs pace the **ambulance's journey**, and they are separate
+on purpose. `SPEED_KM_PER_MIN` (default `1.0`, i.e. ~60 km/h) is a real
+clinical figure and feeds `eta_minutes()`, which acceptance check 5 uses for
+the transport-time window — raising it to make the demo faster would shrink
+every ETA toward zero and quietly make `outside_window` unreachable, turning
+a real triage rule into a no-op. So wall-clock is compressed instead:
+`SIM_TIME_SCALE` (default `45`) multiplies distance covered per tick, and
+`MIN_TRAVEL_MS` (default `12000`) puts a floor on how long any one leg
+takes. The floor matters because the dispatcher deliberately picks the
+*nearest* accepting hospital, so most journeys are short — and a patient can
+be generated on a hospital's own coordinates, which used to arrive instantly
+and left no window to demonstrate a redirect in flight.
+
 ## How to run
 
 ```bash
@@ -90,7 +104,11 @@ make demo         # backend with human-paced delays for a live walkthrough
 ```
 
 The frontend has no build step for the demo — `npm run dev` (via `make dev`)
-serves it directly. `?role=dashboard` (default) shows the full operator
+serves it directly. Note that the UI work departs from the PRD's locked
+dependency list: the operator view uses shadcn/ui, which brings in
+`@radix-ui/*`, `class-variance-authority`, `clsx`, `tailwind-merge` and
+`lucide-react`. Those are presentation-only — no backend dependency was
+added, and nothing in `backend/requirements.txt` changed. `?role=dashboard` (default) shows the full operator
 view; `?role=hospital_A|hospital_B|hospital_C` and `?role=ambulance` show
 single-endpoint views for a multi-screen demo.
 
@@ -99,14 +117,20 @@ single-endpoint views for a multi-screen demo.
 ```
 $ make test
 ...
-206 passed, 2 warnings in 46.47s
+239 passed, 2 warnings in 58.53s
 ```
 
 136 of those predate the multi-hospital extension (Phases 0-11: the
 handoff protocol itself, the API, the frontend's data flow, Phase 10's AI
-sidecar). The other 70 were added across Phases 12-19 for the extension
-below. All 206 pass together — the extension's own regression requirement
-("every pre-existing test must pass unmodified") holds.
+sidecar). The rest were added across Phases 12-21 for the extension below,
+including regression tests for each of the defects listed in "What the
+fuzzing actually found". All 239 pass together — the extension's own
+regression requirement ("every pre-existing test must pass unmodified")
+holds.
+
+There are no `xfail`s. An earlier phase carried one for a known
+stale-message defect; it is fixed (see `notice_seq` below) and the test is
+now an ordinary passing regression test.
 
 **Fuzz**: three properties, each checked by property-based testing over
 randomized scenarios via Hypothesis:
@@ -123,7 +147,8 @@ randomized scenarios via Hypothesis:
   design (each example is far more expensive to construct — a random
   hospital network, not just a random delay table — and this session
   prioritized covering more of the build over maximizing one fuzz test's
-  example count).
+  example count). This asserts I3 as well as I1/I2 now; it excluded I3 for
+  most of the build while the stale-notice defect below was open.
 
 All three pass with zero violations at the counts above.
 
@@ -131,9 +156,10 @@ All three pass with zero violations at the counts above.
 
 # The multi-hospital capacity extension
 
-Phases 12-20 generalize the system above from "three fixed hospitals, one
-transport" to six hospitals with real bed/staffing/equipment capacity, many
-concurrent transports, and patients a hospital may have to decline. The
+Phases 12-21 generalize the system above from "three fixed hospitals, one
+transport" to a network of hospitals with real bed/staffing/equipment
+capacity, many concurrent transports, and patients a hospital may have to
+decline. The
 handoff protocol itself — epochs, activate-first, withdraw-after-proof,
 fencing on both sides — is **completely unchanged**; everything below is a
 layer on top of it, gated so the original three-hospital demo behaves
@@ -189,7 +215,11 @@ one, or abort). A displaced transport that is *already* the current,
 active destination there keeps its bed if it has nowhere else to go — the
 ledger may briefly over-report in that case, which the checker records as
 a warning (`CAPACITY_BREACH_UNRESOLVED`), never as a handoff-safety
-violation. The handoff invariant above is never at stake here: rebalance
+violation. That warning is re-evaluated against the final state before being
+reported: it is raised the instant capacity drops, before rebalance has had
+a chance to act, and a decommission always dips into breach on its way to
+zero beds — leaving it in would report every successful retirement as
+unresolved. The handoff invariant above is never at stake here: rebalance
 only ever touches capacity bookkeeping, never who is effectively active.
 
 ## The three new invariants
@@ -209,6 +239,80 @@ only ever touches capacity bookkeeping, never who is effectively active.
   isn't itself logged — so this check approximates it as 0, which can only
   ever produce a false pass on the transport-time-window check specifically,
   never on capability/bed/specialist/diversion/saturation.)
+
+## The roster is dynamic (Phase 21)
+
+Which hospitals exist is not configuration — it is a projection of the log,
+like everything else. `HospitalRegistered` / `HospitalUpdated` /
+`HospitalDecommissioned` are replayed by `projection.project_hospitals()`,
+and `seed.MULTI_HOSPITALS` is now a **bootstrap** rather than a source of
+truth: written into the log on first start, replayed on every start after,
+so a hospital an operator adds survives a restart and one they retire stays
+retired. `POST`, `PUT` and `DELETE /hospitals` drive it, and roster changes
+push to every browser over the same WebSocket as everything else.
+
+Three things had to happen together for a hospital added at runtime to be
+real rather than a ghost that wins rankings and never answers: a `Facility`,
+its **bus endpoint** (a `PREPARE` is addressed by id), and a dispatcher
+status entry. `Dispatcher._statuses` used to be eagerly keyed from the
+startup roster while `scoring.rank` indexes it unguarded — an added
+hospital was a `KeyError` waiting to happen mid-dispatch.
+
+**Decommissioning adds no new teardown path.** Closing a hospital *is* its
+capacity going to zero, so `decommission_hospital` reports every bed type to
+0 and lets R18's existing rebalance displace the transports holding those
+beds through the ordinary redirect protocol. Ambulances already en route are
+re-routed by machinery that was already proven; the invariant is preserved
+the same way it is everywhere else.
+
+One subtlety this forces on the checker: I4 re-runs `accept()` over
+historical events, so it must resolve a hospital that has since been
+retired. `project_hospitals()` therefore returns both `active` (the live
+network) and `known` (every hospital ever registered, at its last
+configuration), and `check()` audits history against `known`. Judging a past
+acceptance against today's roster would turn every decision a
+decommissioned hospital ever made into a phantom violation, and every bed it
+held into a phantom overbooking.
+
+## What the fuzzing actually found
+
+These are defects the property-based tests and adversarial probes surfaced
+in code that already passed its unit tests. Each has a regression test, and
+each was confirmed by reverting the fix and watching that test fail.
+
+- **A stale in-flight `REDIRECT_NOTICE` could strand an ambulance.** R15
+  walks a whole candidate list under **one** epoch, so a notice for a
+  candidate that has since declined carries the same epoch as its
+  replacement and the epoch fence cannot tell them apart. The ambulance drove
+  to the hospital that had just refused it and arrived with no reservation
+  (I3). Fixed by stamping a per-transport `notice_seq` on every
+  `REDIRECT_NOTICE`; `Ambulance.stand_down(through_seq)` fences everything
+  issued up to the point the dispatcher gave up. This was an `xfail` for most
+  of the build because fixing it needed a protocol decision, not a patch.
+- **An abandoned candidate was left ACTIVE.** `_try_next_candidate` moved on
+  without withdrawing the hospital it was leaving. If that candidate's
+  `READY` had already come back, its `ACTIVATE_AT` was still crossing the bus
+  and activated it *after* it was abandoned — a facility active for a
+  transport whose dispatcher had committed elsewhere, which is a direct
+  `ZERO_ACTIVE` failure. Surfaced by fuzzing capacity churn against
+  in-flight handshakes (112 violations across 7 of 30 trials); zero across
+  120 trials after.
+- **The same path crashed the dispatcher.** The branch that routes an
+  `ACTIVATE_AT` receipt keys off "not starting", and giving up on a placement
+  flips that status — so a *start*'s ack was routed down the *redirect* path
+  and dereferenced a `cutover_at` of `None`.
+- **`PUT /hospitals/{id}` silently ignored bed changes.** Bed counts live on
+  the event-sourced `HospitalStatus`, not the static `Hospital` record, so
+  updating only the record returned `200` while capacity never moved.
+- **A new hospital could take over a legacy facility id.** `Hospital_A/B/C`
+  are plain demo facilities with no `accept()`, sharing the same id space and
+  bus. Registering over one produced a hospital that ranked and won like any
+  other but admitted patients no capacity check had ever approved.
+
+The pattern worth noting: every one of these is a *late message meeting a
+changed decision*. That is the failure class this system exists to handle,
+and the ones it missed were all in the newer capacity layer rather than the
+original protocol.
 
 ## Concurrency note
 
