@@ -114,6 +114,14 @@ class Dispatcher:
         if target == record.pending_destination:
             return  # R9: already pending this exact target
 
+        if record.current_destination is None:
+            # Still inside start()'s own flow: there is no "current" facility
+            # yet to protect or fall back to, so R6/R7/R8's machinery (which
+            # all assume one exists) doesn't apply — see
+            # _redirect_before_first_activation for what happens instead.
+            self._redirect_before_first_activation(transport_id, record, target)
+            return
+
         if record.pending_destination is None:
             if target == record.current_destination:
                 return  # R8, no pending transition: no-op
@@ -251,9 +259,7 @@ class Dispatcher:
         # STARTING, so this ack — not a timer — is what flips current.
         record.current_destination = record.pending_destination
         record.current_epoch = record.pending_epoch
-        record.pending_destination = None
-        record.pending_epoch = None
-        record.activate_command_id = None
+        self._clear_pending(record)  # also retires notice/prepare tracking — see its docstring
         record.status = DispatcherStatus.STABLE
         self._log(transport_id, record.current_epoch, EventType.CUTOVER_APPLIED, {"current_destination": record.current_destination})
 
@@ -346,6 +352,25 @@ class Dispatcher:
         record.notice_command_id = self._send(transport_id, record, target, epoch, ActionType.REDIRECT_NOTICE)
         self._start_ready_timer(transport_id, record)
 
+    def _redirect_before_first_activation(self, transport_id: str, record: _TransportState, target: str) -> None:
+        """A redirect() arriving before start()'s own cutover has ever
+        applied — an interaction R1-R12's text doesn't cover, since R6/R7/R8
+        all assume a current facility exists to REMAIN at or fall back to.
+        Fail-safe here means simply retargeting what start() is waiting on,
+        at a fresh epoch, and telling the abandoned target to stand down —
+        never touching a "current" that doesn't exist yet."""
+        old_target = record.pending_destination
+        epoch = self._allocate_epoch(record)
+        self._send(transport_id, record, old_target, epoch, ActionType.WITHDRAW)
+        record.pending_destination = target
+        record.pending_epoch = epoch
+        record.ready_received = False
+        record.notice_applied = False
+        record.status = DispatcherStatus.STARTING
+        self._log(transport_id, epoch, EventType.REDIRECT_REQUESTED, {"target": target})
+        record.prepare_command_id = self._send(transport_id, record, target, epoch, ActionType.PREPARE)
+        record.notice_command_id = self._send(transport_id, record, target, epoch, ActionType.REDIRECT_NOTICE)
+
     def _clear_pending(self, record: _TransportState) -> None:
         record.pending_destination = None
         record.pending_epoch = None
@@ -355,6 +380,19 @@ class Dispatcher:
         record.cutover_timer = None
         record.receipt_deadline_timer = None
         record.ready_timer = None
+        # Also retire this concluded transition's own precondition tracking:
+        # a late APPLIED for its notice (or READY for its PREPARE) is *not*
+        # caught by the epoch fence — its epoch equals highest_epoch_seen,
+        # not less than it — so without this, it would still match here and
+        # re-trigger _schedule_cutover against a pending_epoch that's now
+        # None. Once cleared, such a late ack matches nothing and is a
+        # harmless no-op, the same way a cleared activate_command_id already
+        # protects the redirect flow's activate-APPLIED.
+        record.prepare_command_id = None
+        record.notice_command_id = None
+        record.ready_received = False
+        record.notice_applied = False
+        record.ready_retried = False
 
     def _allocate_epoch(self, record: _TransportState) -> int:
         epoch = record.highest_epoch_seen + 1
