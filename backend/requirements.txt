@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+hypothesis
+pytest
+groq
+python-dotenv
