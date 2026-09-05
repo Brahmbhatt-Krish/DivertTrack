@@ -117,14 +117,14 @@ single-endpoint views for a multi-screen demo.
 ```
 $ make test
 ...
-239 passed, 2 warnings in 58.53s
+241 passed, 2 warnings in 60.69s
 ```
 
 136 of those predate the multi-hospital extension (Phases 0-11: the
 handoff protocol itself, the API, the frontend's data flow, Phase 10's AI
 sidecar). The rest were added across Phases 12-21 for the extension below,
 including regression tests for each of the defects listed in "What the
-fuzzing actually found". All 239 pass together — the extension's own
+fuzzing actually found". All 241 pass together — the extension's own
 regression requirement ("every pre-existing test must pass unmodified")
 holds.
 
@@ -304,6 +304,16 @@ each was confirmed by reverting the fix and watching that test fail.
 - **`PUT /hospitals/{id}` silently ignored bed changes.** Bed counts live on
   the event-sourced `HospitalStatus`, not the static `Hospital` record, so
   updating only the record returned `200` while capacity never moved.
+- **A hospital's last bed could never be used.** The dispatcher reserves
+  optimistically *before* sending `PREPARE`, so by the time the facility
+  evaluated that request its own reservation was already in the ledger.
+  `free()` counted it, returned 0, and the hospital declined its own
+  applicant — every hospital behaved as though it were one bed smaller than
+  it reported, for every bed type. Acceptance now evaluates against the
+  ledger with the requesting transport's own reservation removed
+  (`projection.without_transport`). Verified not to reintroduce overbooking:
+  40 trials of 60 patients against 6 hospitals, deliberately more patients
+  than beds, zero I2 violations.
 - **A new hospital could take over a legacy facility id.** `Hospital_A/B/C`
   are plain demo facilities with no `accept()`, sharing the same id space and
   bus. Registering over one produced a hospital that ranked and won like any

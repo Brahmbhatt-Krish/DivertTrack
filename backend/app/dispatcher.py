@@ -19,7 +19,7 @@ from app.dispatcher_status import DispatcherStatus
 from app.events import Event, EventStore, EventType
 from app.messages import Ack, AckType, ActionType, Command
 from app.models import BedType, Hospital, HospitalStatus, Need, Patient, Policy, initial_status
-from app.projection import HospitalLedgerView, empty_ledger_view
+from app.projection import HospitalLedgerView, empty_ledger_view, without_transport
 from app.scoring import eta_minutes, rank
 
 # Pure scheduling margin for the dispatcher's own cutover-apply timer — see
@@ -287,11 +287,11 @@ class Dispatcher:
                 self._recheck_current_destination(transport_id, record)
 
     def _recheck_current_destination(self, transport_id: str, record: _TransportState) -> None:
-        decision = self._accept_for(record.patient, record.current_destination, record.position)
+        decision = self._accept_for(record.patient, record.current_destination, record.position, transport_id)
         if decision.accepted:
             return
         old_destination = record.current_destination
-        candidates = self._ranked_candidates(record.patient, record.position)
+        candidates = self._ranked_candidates(record.patient, record.position, transport_id)
         if not candidates:
             self._log(transport_id, record.current_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": []})
             return  # R17: keep the current destination
@@ -371,7 +371,7 @@ class Dispatcher:
         # it cannot be moved" — the ledger may over-report here; checker.py
         # (Phase 16) records that as a warning, never a handoff violation.
         if self._config.policy is Policy.AUTO:
-            candidates = self._ranked_candidates(record.patient, record.position)
+            candidates = self._ranked_candidates(record.patient, record.position, transport_id)
             if candidates:
                 self._redirect_capacity_aware(transport_id, record, candidates[0])
                 return
@@ -404,21 +404,40 @@ class Dispatcher:
             ventilator_holders=frozenset(entry.ventilator_holders),
         )
 
-    def _all_ledger_views(self) -> dict[str, HospitalLedgerView]:
-        return {hospital_id: self._ledger_view(hospital_id) for hospital_id in self._hospitals}
+    def _all_ledger_views(self, transport_id: Optional[str] = None) -> dict[str, HospitalLedgerView]:
+        views = {hospital_id: self._ledger_view(hospital_id) for hospital_id in self._hospitals}
+        if transport_id is None:
+            return views
+        return {hid: without_transport(view, transport_id) for hid, view in views.items()}
 
-    def _accept_for(self, patient: Patient, hospital_id: str, position: tuple[float, float]):
+    def _accept_for(
+        self,
+        patient: Patient,
+        hospital_id: str,
+        position: tuple[float, float],
+        transport_id: Optional[str] = None,
+    ):
         hospital = self._hospitals[hospital_id]
         status = self._statuses[hospital_id]
         eta = eta_minutes(position, hospital, self._config.speed_km_per_min)
-        return accept(patient, hospital, status, self._ledger_view(hospital_id), eta, self._config.saturation_limit)
+        view = self._ledger_view(hospital_id)
+        if transport_id is not None:
+            # Asking on behalf of a transport that may already be holding a
+            # bed here (a re-rank, or a re-check of its own destination): its
+            # own reservation must not count against it. See
+            # projection.without_transport.
+            view = without_transport(view, transport_id)
+        return accept(patient, hospital, status, view, eta, self._config.saturation_limit)
 
-    def _ranked_candidates(self, patient: Patient, position: tuple[float, float]) -> list[str]:
+    def _ranked_candidates(
+        self, patient: Patient, position: tuple[float, float], transport_id: Optional[str] = None
+    ) -> list[str]:
         """Every accepted hospital, best first (R17's choose()/rank()) —
         used to build a fresh candidate_queue for an auto-policy start/
         redirect with no explicit target."""
         ranked = rank(
-            patient, position, list(self._hospitals.values()), self._statuses, self._all_ledger_views(),
+            patient, position, list(self._hospitals.values()), self._statuses,
+            self._all_ledger_views(transport_id),
             self._config.speed_km_per_min, self._config.load_weight, self._config.saturation_limit,
         )
         return [candidate.hospital_id for candidate in ranked if candidate.score is not None]
@@ -539,7 +558,7 @@ class Dispatcher:
         while record.candidate_queue:
             target = record.candidate_queue.pop(0)
             record.candidates_tried.append(target)
-            decision = self._accept_for(record.patient, target, record.position)
+            decision = self._accept_for(record.patient, target, record.position, transport_id)
             if decision.accepted:
                 break
             self._log(
@@ -632,14 +651,14 @@ class Dispatcher:
         that path doesn't thread a full fallback queue through the
         cancel-and-restart, a disclosed scope simplification)."""
         if target is not None:
-            decision = self._accept_for(record.patient, target, record.position)
+            decision = self._accept_for(record.patient, target, record.position, transport_id)
             if not decision.accepted:
                 raise NotEligible(decision.reason)
             candidates = [target]
         else:
             if self._config.policy is not Policy.AUTO:
                 raise TargetRequired("target is required for a manual-policy redirect")
-            candidates = self._ranked_candidates(record.patient, record.position)
+            candidates = self._ranked_candidates(record.patient, record.position, transport_id)
             if not candidates:
                 self._log(transport_id, record.current_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": []})
                 return  # R17: no candidate at all -- keep the current destination

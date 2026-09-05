@@ -294,3 +294,81 @@ def test_an_abandoned_candidate_is_withdrawn_not_orphaned() -> None:
             v for v in result.violations if v.kind.value in ("ZERO_ACTIVE", "MULTI_ACTIVE")
         ]
         assert not handoff, f"trial {trial}: {handoff[:3]}"
+
+
+def test_a_hospitals_last_bed_can_actually_be_used() -> None:
+    """The dispatcher reserves optimistically *before* sending PREPARE, so by
+    the time the facility evaluates that request its own reservation is
+    already in the ledger. Counting it made free() return 0 and the hospital
+    declined its own applicant — meaning no transport could ever be given a
+    hospital's last bed of any type, and every hospital behaved as though it
+    were one bed smaller than it reported.
+    """
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import BedType as _BedType
+    from app.models import Capability as _Capability
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.simulation import Simulation
+
+    hospital = Hospital(
+        id="H1", name="H1", location=(0.0, 0.0),
+        beds_total={_BedType.ICU: 1},  # exactly one, and it is free
+        capabilities=frozenset({_Capability.CT_SCAN}), ventilators_total=1,
+    )
+    patient = Patient(
+        id="P1", acuity=2,  # acuity <= 2 -> needs that ICU bed
+        condition=_ConditionCategory.GENERAL, age_group=_AgeGroup.ADULT,
+        needs=frozenset(), override="none",
+    )
+
+    clock, store = _FakeClock(), _EventStore(":memory:")
+    sim = Simulation(clock, store, _config(), hospitals={"H1": hospital})
+    sim.start_batch([(patient, (0.0, 0.0))])
+    clock.run_until_quiet()
+
+    transport_id = next(iter(sim.dispatcher.known_patients()))
+    declines = [
+        event for event in store.replay(transport_id)
+        if event.type.value == "CandidateDeclined"
+    ]
+    assert not declines, f"the only free bed was refused: {declines}"
+    assert sim.dispatcher.current_destination_of(transport_id) == "H1"
+
+
+def test_the_last_bed_is_still_only_given_to_one_transport() -> None:
+    """The counterpart to the test above: excluding a transport's own
+    reservation must not let two of them hold the same last bed."""
+    from app.checker import check
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import BedType as _BedType
+    from app.models import Capability as _Capability
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.simulation import Simulation
+
+    hospital = Hospital(
+        id="H1", name="H1", location=(0.0, 0.0), beds_total={_BedType.ICU: 1},
+        capabilities=frozenset({_Capability.CT_SCAN}), ventilators_total=2,
+    )
+
+    def _icu_patient(patient_id: str) -> Patient:
+        return Patient(
+            id=patient_id, acuity=2, condition=_ConditionCategory.GENERAL,
+            age_group=_AgeGroup.ADULT, needs=frozenset(), override="none",
+        )
+
+    clock, store = _FakeClock(), _EventStore(":memory:")
+    sim = Simulation(clock, store, _config(), hospitals={"H1": hospital})
+    sim.start_batch([(_icu_patient("P1"), (0.0, 0.0)), (_icu_patient("P2"), (0.0, 0.0))])
+    clock.run_until_quiet()
+
+    placed = [
+        transport_id for transport_id in sim.dispatcher.known_patients()
+        if sim.dispatcher.current_destination_of(transport_id) == "H1"
+    ]
+    assert len(placed) == 1, f"one bed, but {len(placed)} transports placed: {placed}"
+    result = check(store.replay(), patients=sim.dispatcher.known_patients())
+    assert not [v for v in result.violations if v.kind.value == "OVERBOOKED"], result.violations

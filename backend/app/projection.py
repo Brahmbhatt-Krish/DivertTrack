@@ -320,6 +320,30 @@ def project_hospitals(events: Sequence[Event]) -> HospitalRoster:
     return HospitalRoster(active=active, known=known)
 
 
+def without_transport(view: HospitalLedgerView, transport_id: str) -> HospitalLedgerView:
+    """The same ledger with one transport's *reservation* taken out.
+
+    Acceptance has to be asked "do you have room for this patient", not "do
+    you have room for this patient on top of the bed you are already holding
+    for them". The dispatcher reserves optimistically before sending PREPARE,
+    so by the time the facility evaluates the request its own reservation is
+    already in the ledger — counting it made a hospital refuse the last bed
+    of a type to the very transport that had just claimed it, which meant no
+    transport could ever be given a hospital's last bed.
+
+    Occupancy is deliberately left alone: an occupied bed has a patient
+    physically in it, and no transport should ever hold both.
+    """
+    return HospitalLedgerView(
+        hospital_id=view.hospital_id,
+        reserved={
+            bed_type: ids - {transport_id} for bed_type, ids in view.reserved.items()
+        },
+        occupied=view.occupied,
+        ventilator_holders=view.ventilator_holders - {transport_id},
+    )
+
+
 def free(view: HospitalLedgerView, status: HospitalStatus, bed_type: BedType) -> int:
     used = len(view.reserved.get(bed_type, frozenset())) + len(view.occupied.get(bed_type, frozenset()))
     return status.beds_total.get(bed_type, 0) - used

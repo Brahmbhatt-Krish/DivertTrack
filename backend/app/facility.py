@@ -20,7 +20,7 @@ from app.events import Event, EventStore, EventType
 from app.messages import Ack, AckType, ActionType, Command, FacilityState
 from app.models import Hospital, HospitalStatus, Patient, initial_status
 from app.projection import apply_status_event as _apply_status_event
-from app.projection import empty_ledger_view, project_ledger
+from app.projection import empty_ledger_view, project_ledger, without_transport
 
 # Every clock.schedule() a Facility makes for a transport is registered here
 # so the epoch fence (step 4) can cancel *any* stale pending action — a
@@ -241,7 +241,10 @@ class Facility:
         if self._hospital is not None and command.patient is not None and not already_armed:
             self._known_patients[command.transport_id] = command.patient
             eta = command.eta_minutes if command.eta_minutes is not None else 0.0
-            view = self._ledger_view()
+            # Excluding this transport's own reservation: the dispatcher has
+            # already reserved a bed before sending this PREPARE, and counting
+            # it made the hospital decline its own applicant for the last bed.
+            view = without_transport(self._ledger_view(), command.transport_id)
             decision = accept(command.patient, self._hospital, self._status, view, eta, self._config.saturation_limit)
             if not decision.accepted:
                 self._decline(record, command, decision.reason)
