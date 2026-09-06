@@ -1,6 +1,7 @@
 // One page, ?role= filters the view: dashboard (default) | hospital_A |
 // hospital_B | hospital_C | ambulance.
 import { useMemo, useState } from "react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useHubState, facilityKey } from "./state.js";
 import TopBar from "./components/TopBar.jsx";
 import InvariantBadge from "./components/InvariantBadge.jsx";
@@ -73,11 +74,21 @@ export default function App() {
     <div className="min-h-screen">
       <TopBar connected={state.connected} />
 
-      <main className="mx-auto max-w-6xl space-y-10 px-6 py-8">
-        <section className="space-y-4">
+      {/* Two layers, as tabs rather than one long scroll. Stacked, the
+          capacity network sat below the fold and reviewers concluded the
+          three-hospital protocol demo was the entire system. A tab cannot be
+          scrolled past. */}
+      <main className="mx-auto max-w-6xl px-6 py-8">
+        <Tabs defaultValue="protocol" className="space-y-6">
+          <TabsList>
+            <TabsTrigger value="protocol">Handoff protocol</TabsTrigger>
+            <TabsTrigger value="capacity">Capacity network</TabsTrigger>
+          </TabsList>
+
+        <TabsContent value="protocol" className="space-y-4">
           <SectionHeading
             title="Single transport"
-            subtitle={`The handoff protocol on one ambulance (${DEMO_TRANSPORT_ID}) across three facilities.`}
+            subtitle={`One ambulance (${DEMO_TRANSPORT_ID}), three facilities, an unreliable network — and exactly one facility active at every instant.`}
           />
 
           <InvariantBadge result={invariantResult} />
@@ -112,12 +123,12 @@ export default function App() {
           </div>
 
           <Timeline events={state.timeline} />
-        </section>
+        </TabsContent>
 
-        <section className="space-y-4">
+        <TabsContent value="capacity" className="space-y-4">
           <SectionHeading
             title="Multi-hospital capacity"
-            subtitle="Six hospitals with real bed capacity, many concurrent transports, and hospitals that can decline."
+            subtitle="The same protocol, carrying a second problem: real bed capacity, many concurrent transports, hospitals that decline, and a roster that changes while ambulances are in the air."
           />
 
           <GlobalInvariantBadge refreshKey={refreshKey} />
@@ -135,7 +146,8 @@ export default function App() {
           <AlertsPanel alerts={state.alerts} />
 
           <TransportsTable rows={state.transportRows} />
-        </section>
+        </TabsContent>
+        </Tabs>
       </main>
     </div>
   );

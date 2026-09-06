@@ -1,5 +1,6 @@
 // State badge, epoch, STALE badge, and the last accepted / last rejected
 // command — all derived here from the shared timeline, not fetched.
+import { Building2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -47,8 +48,15 @@ export default function FacilityCard({ facilityId, view, events, arrivedAt = nul
   const lastRejected = lastMatching(events, facilityId, (e) => REJECTED_TYPES.has(e.type));
 
   return (
-    <Card className={cn("gap-0 py-4", large && "py-6")}>
+    // Hospitals are the *participants* in the protocol: they answer, they
+    // never decide the handoff. The dispatcher card is marked differently on
+    // purpose, so the architecture reads off the screen without narration.
+    <Card className={cn("gap-0 border-l-2 border-l-border py-4", large && "py-6")}>
       <CardHeader className="px-4 pb-3">
+        <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          <Building2 className="size-3" />
+          Receiving facility
+        </div>
         <div className="flex items-center justify-between gap-2">
           <CardTitle className={cn("font-mono text-sm", large && "text-xl")}>{facilityId}</CardTitle>
           {stale && (

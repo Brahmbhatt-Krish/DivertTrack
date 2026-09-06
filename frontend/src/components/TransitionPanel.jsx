@@ -2,7 +2,7 @@
 // four things R3-R5 wait on: READY, the ambulance's notice-applied,
 // ACTIVATE's RECEIVED, and WithdrawSent.
 import { useEffect, useRef, useState } from "react";
-import { ArrowRight, Check, Circle } from "lucide-react";
+import { ArrowRight, Check, Circle, RadioTower } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -18,10 +18,20 @@ export default function TransitionPanel({ view, events }) {
 
   if (!view || view.pending_destination == null) {
     return (
-      <Card className="py-0">
-        <CardContent className="flex items-center gap-2 px-4 py-3.5 text-sm text-muted-foreground">
+      // The dispatcher is the one component that *decides*; the hospitals only
+      // answer. It carries an accent border and its own label so the two roles
+      // are distinguishable on screen without anyone explaining them.
+      <Card className="gap-0 border-l-2 border-l-primary py-4">
+        <CardHeader className="px-4 pb-3">
+        <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-primary/70">
+          <RadioTower className="size-3" />
+          Dispatcher
+        </div>
+          <CardTitle className="text-sm">No transition in progress</CardTitle>
+        </CardHeader>
+        <CardContent className="flex items-center gap-2 px-4 text-sm text-muted-foreground">
           <Circle className="size-3.5" />
-          No transition in progress.
+          Waiting — one facility is active and stable.
         </CardContent>
       </Card>
     );
@@ -58,8 +68,12 @@ export default function TransitionPanel({ view, events }) {
   const withdrawSent = epochEvents.some((e) => e.type === "WithdrawSent");
 
   return (
-    <Card className="gap-0 py-4">
+    <Card className="gap-0 border-l-2 border-l-primary py-4">
       <CardHeader className="px-4 pb-3">
+        <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-primary/70">
+          <RadioTower className="size-3" />
+          Dispatcher
+        </div>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <CardTitle className="flex items-center gap-2 text-sm">
             <span className="text-muted-foreground">Transitioning</span>
