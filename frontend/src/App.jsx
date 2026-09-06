@@ -19,6 +19,9 @@ import AlertsPanel from "./components/AlertsPanel.jsx";
 import AmbulanceFleet from "./components/AmbulanceFleet.jsx";
 import MultiHospitalControls from "./components/MultiHospitalControls.jsx";
 import GlobalInvariantBadge from "./components/GlobalInvariantBadge.jsx";
+import AmbulanceScreen from "./screens/AmbulanceScreen.jsx";
+import HospitalScreen from "./screens/HospitalScreen.jsx";
+import DispatcherScreen from "./screens/DispatcherScreen.jsx";
 
 const DEMO_TRANSPORT_ID = "AMB-101";
 const FACILITY_IDS = ["Hospital_A", "Hospital_B", "Hospital_C"];
@@ -42,37 +45,56 @@ export default function App() {
   const ambulanceView = state.ambulances[DEMO_TRANSPORT_ID];
   const invariantResult = state.invariant[DEMO_TRANSPORT_ID];
 
+  // Each endpoint gets its own screen showing only its own knowledge. Run
+  // them in separate windows and the protocol becomes watchable: the new
+  // hospital goes ARMED then ACTIVE, the crew's destination flips, and only
+  // *then* does the old hospital stand down — each on its own display, in the
+  // order the protocol guarantees rather than the order a narrator claims.
   if (role in ROLE_TO_FACILITY_ID) {
     const facilityId = ROLE_TO_FACILITY_ID[role];
-    const view = state.facilities[facilityKey(facilityId, DEMO_TRANSPORT_ID)];
     return (
-      <div className="flex min-h-screen items-center justify-center p-8">
-        <div className="w-full max-w-md">
-          <FacilityCard
-            facilityId={facilityId}
-            view={view}
-            events={state.timeline}
-            arrivedAt={transportView?.arrived_at ?? null}
-            large
-          />
-        </div>
+      <div className="min-h-screen">
+        <TopBar connected={state.connected} role={role} />
+        <HospitalScreen
+          facilityId={facilityId}
+          view={state.facilities[facilityKey(facilityId, DEMO_TRANSPORT_ID)]}
+          events={state.timeline}
+          arrivedAt={transportView?.arrived_at ?? null}
+        />
       </div>
     );
   }
 
   if (role === "ambulance") {
     return (
-      <div className="flex min-h-screen items-center justify-center p-8">
-        <div className="w-full max-w-md">
-          <AmbulancePanel ambulanceView={ambulanceView} transportId={DEMO_TRANSPORT_ID} />
-        </div>
+      <div className="min-h-screen">
+        <TopBar connected={state.connected} role={role} />
+        <AmbulanceScreen ambulanceView={ambulanceView} transportId={DEMO_TRANSPORT_ID} />
+      </div>
+    );
+  }
+
+  if (role === "dispatcher") {
+    return (
+      <div className="min-h-screen">
+        <TopBar connected={state.connected} role={role} />
+        <DispatcherScreen
+          state={state}
+          transportId={DEMO_TRANSPORT_ID}
+          facilityIds={FACILITY_IDS}
+          transportView={transportView}
+          invariantResult={invariantResult}
+          manualMode={manualMode}
+          onManualModeChange={setManualMode}
+          facilityKey={facilityKey}
+        />
       </div>
     );
   }
 
   return (
     <div className="min-h-screen">
-      <TopBar connected={state.connected} />
+      <TopBar connected={state.connected} role={role} />
 
       {/* Two layers, as tabs rather than one long scroll. Stacked, the
           capacity network sat below the fold and reviewers concluded the

@@ -190,12 +190,21 @@ def test_ai_recommend_is_unavailable_without_a_configured_api_key(
 # -- WebSocket ---------------------------------------------------------------
 
 
+def _next_batch(websocket) -> dict:
+    """The next batch of *changes*, skipping the snapshot the hub sends on
+    connect (ws.py's _send_snapshot) — that one describes the world as it
+    already stood, not what a test just did."""
+    while True:
+        message = websocket.receive_json()
+        assert message["kind"] == "batch"
+        if not message.get("snapshot"):
+            return message
+
+
 def _batch_kinds(websocket) -> list[str]:
     """The hub coalesces a flush window into one {"kind": "batch"} message
     (see ws.py) — this unwraps it to the kinds it carries."""
-    message = websocket.receive_json()
-    assert message["kind"] == "batch"
-    return [sub["kind"] for sub in message["messages"]]
+    return [sub["kind"] for sub in _next_batch(websocket)["messages"]]
 
 
 def test_websocket_receives_at_least_one_message_after_a_redirect(client: TestClient) -> None:
@@ -301,9 +310,8 @@ def test_reset_broadcasts_a_wipe_and_fresh_hospital_views(client: TestClient) ->
 
     with client.websocket_connect("/events/live") as websocket:
         client.post("/demo/reset")
-        message = websocket.receive_json()
+        message = _next_batch(websocket)
 
-    assert message["kind"] == "batch"
     kinds = [sub["kind"] for sub in message["messages"]]
     # Order matters: the client folds these in sequence, so a "reset" landing
     # after the fresh views would blank them right back out.
@@ -337,7 +345,7 @@ def test_websocket_pushes_the_transport_list_so_the_table_stays_live(client: Tes
             "/transports/batch",
             json={"patients": [{"id": "P1", "acuity": 2, "condition": "GENERAL", "position": [8.0, 8.0]}]},
         )
-        message = websocket.receive_json()
+        message = _next_batch(websocket)
 
     pushed = [sub for sub in message["messages"] if sub["kind"] == "transport_list"]
     assert pushed, "expected a transport_list push"
@@ -353,7 +361,7 @@ def test_reset_pushes_an_empty_transport_list(client: TestClient) -> None:
     )
     with client.websocket_connect("/events/live") as websocket:
         client.post("/demo/reset")
-        message = websocket.receive_json()
+        message = _next_batch(websocket)
 
     pushed = [sub for sub in message["messages"] if sub["kind"] == "transport_list"]
     assert pushed and pushed[-1]["rows"] == [], "the table must empty itself on reset"
@@ -395,7 +403,7 @@ def test_transport_list_route_and_hub_push_return_the_same_shape(client: TestCli
         )
         pushed = None
         while pushed is None:
-            message = websocket.receive_json()
+            message = _next_batch(websocket)
             for sub in message["messages"]:
                 if sub["kind"] == "transport_list":
                     pushed = sub["rows"]
@@ -542,7 +550,7 @@ def test_the_seeded_roster_is_bootstrapped_as_events_not_config(client: TestClie
 def test_decommissioning_is_visible_on_the_websocket_as_a_roster_push(client: TestClient) -> None:
     with client.websocket_connect("/events/live") as websocket:
         client.delete("/hospitals/Hospital_3")
-        message = websocket.receive_json()
+        message = _next_batch(websocket)
     rosters = [sub for sub in message["messages"] if sub["kind"] == "roster"]
     assert rosters, "a roster change must push the whole roster"
     assert "Hospital_3" not in [h["id"] for h in rosters[-1]["hospitals"]]

@@ -80,6 +80,51 @@ class Hub:
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._connections.add(websocket)
+        await self._send_snapshot(websocket)
+
+    async def _send_snapshot(self, websocket: WebSocket) -> None:
+        """Bring a newly connected client up to date immediately.
+
+        Everything here is *live* state that no event will re-announce: the
+        hub only pushes when something changes, so a client that connects
+        mid-run showed an empty world until the next event happened to fire.
+        On the per-endpoint screens that was stark — an ambulance already
+        halfway to a hospital rendered as "no destination".
+        """
+        if self._store is None or self._source is None:
+            return
+        # Project the whole log once rather than walking transport_list():
+        # that only returns *capacity-aware* transports, so the plain
+        # three-hospital demo (AMB-101, no patient record) was skipped
+        # entirely and its screens still opened empty. Every transport that
+        # appears in the log belongs in a snapshot.
+        events = self._store.replay()
+        projection = project(events)
+        messages: list[dict[str, Any]] = []
+        for tid, view in projection.transports.items():
+            messages.append({"kind": "transport", "transport_id": tid, "view": view})
+            messages.append(
+                {"kind": "invariant", "transport_id": tid, "result": check(self._store.replay(tid))}
+            )
+            ambulance = self._source.ambulance_view(tid)
+            if ambulance is not None:
+                messages.append({"kind": "ambulance", "transport_id": tid, **ambulance})
+        for (facility_id, owner), facility_view in projection.facilities.items():
+            messages.append(
+                {"kind": "facility", "facility_id": facility_id,
+                 "transport_id": owner, "view": facility_view}
+            )
+        messages.append({"kind": "roster", "hospitals": self._roster_views()})
+        messages.append({"kind": "transport_list", "rows": self._source.transport_list()})
+        messages.append({"kind": "in_flight", "messages": self._source.in_flight()})
+        try:
+            # Marked so a client (or a test) can tell "here is the world as it
+            # stands" apart from "here is what just changed".
+            await websocket.send_json(
+                jsonable_encoder({"kind": "batch", "snapshot": True, "messages": messages})
+            )
+        except Exception:
+            self._connections.discard(websocket)
 
     def disconnect(self, websocket: WebSocket) -> None:
         self._connections.discard(websocket)
