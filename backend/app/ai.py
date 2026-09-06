@@ -52,6 +52,45 @@ _RECOMMEND_SYSTEM_PROMPT = (
 )
 
 
+_JUSTIFY_MODEL = "allam-2-7b"
+_PARSE_MODEL = "allam-2-7b"
+_JUSTIFY_MAX_TOKENS = 300
+_PARSE_MAX_TOKENS = 300
+
+_JUSTIFY_SYSTEM_PROMPT = (
+    "You explain, to an ambulance dispatcher, why one hospital was chosen for "
+    "a patient over the others. You are given the chosen hospital, the "
+    "patient, and the full ranked shortlist: accepted hospitals have a score "
+    "(higher is better; it trades travel time against how full the hospital "
+    "is) and rejected ones have a reason code instead. Write 2 to 4 plain "
+    "sentences. Say why the chosen one won, and name the most significant "
+    "hospitals that were ruled out and what ruled them out, translating the "
+    "reason codes into plain English (no_bed:ICU means it had no free "
+    "intensive-care bed; no_capability:CATH_LAB means it has no "
+    "catheterisation lab; outside_window means it was too far for this "
+    "condition; on_full_diversion means it was not accepting patients at "
+    "all). Never invent a hospital or a reason that is not in the data given "
+    "to you."
+)
+
+_PARSE_SYSTEM_PROMPT = (
+    "You turn a dispatcher's free-text description of a patient into JSON. "
+    "Respond with JSON only, no prose: "
+    '{"acuity": 1-5, "condition": string, "age_group": string, '
+    '"needs": [string], "override": "none"|"nearest_capable"}. '
+    "acuity is a triage score where 1 is critical and 5 is minor. "
+    "condition is one of CARDIAC, TRAUMA, STROKE, BURN, RESPIRATORY, "
+    "OBSTETRIC, PAEDIATRIC, PSYCHIATRIC, GENERAL. "
+    "age_group is one of NEONATE, CHILD, ADULT. "
+    "needs is any of VENTILATOR, ISOLATION, CATH_LAB, CT_SCAN, BARIATRIC, "
+    "BLOOD_PRODUCTS, and is usually empty. "
+    "Use override \"nearest_capable\" only if the text says to take them to "
+    "the nearest possible hospital regardless of anything else. "
+    "If the text does not say, default to acuity 3, GENERAL, ADULT, no needs, "
+    "override none. Use only the exact values listed above."
+)
+
+
 @dataclass(frozen=True)
 class AmbulancePosition:
     """What recommend() knows about where the ambulance is right now —
@@ -207,3 +246,116 @@ def recommend(
     result = {"ranked": ranked}
     cache[key] = result
     return result
+
+
+# -- 1. why was this hospital chosen? ---------------------------------------
+
+
+def justify(
+    transport_id: str,
+    chosen: Optional[str],
+    patient: dict,
+    candidates: Sequence[dict],
+    client: Optional[Groq] = None,
+) -> dict:
+    """Narrate one placement decision from the ranking that produced it.
+
+    Purely explanatory: it is handed the decision that was already made and
+    the shortlist it came from, and never gets to influence either. The
+    ranking is deterministic and reproducible; this only puts it in English.
+    """
+    if not candidates:
+        return {"explanation": "No hospitals were evaluated for this transport yet."}
+
+    resolved_client = client if client is not None else _default_client()
+    if resolved_client is None:
+        return dict(_UNAVAILABLE)
+
+    payload = json.dumps(
+        {"chosen": chosen, "patient": patient, "shortlist": list(candidates)},
+        separators=(",", ":"),
+    )
+    try:
+        completion = resolved_client.chat.completions.create(
+            model=_JUSTIFY_MODEL,
+            temperature=0,
+            max_completion_tokens=_JUSTIFY_MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": _JUSTIFY_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+        )
+        text = completion.choices[0].message.content
+    except Exception:
+        return dict(_UNAVAILABLE)
+
+    if not isinstance(text, str) or not text.strip():
+        return dict(_UNAVAILABLE)
+    return {"explanation": text.strip()}
+
+
+# -- 2. free text -> a patient ----------------------------------------------
+
+_CONDITIONS = {
+    "CARDIAC", "TRAUMA", "STROKE", "BURN", "RESPIRATORY",
+    "OBSTETRIC", "PAEDIATRIC", "PSYCHIATRIC", "GENERAL",
+}
+_AGE_GROUPS = {"NEONATE", "CHILD", "ADULT"}
+_NEEDS = {"VENTILATOR", "ISOLATION", "CATH_LAB", "CT_SCAN", "BARIATRIC", "BLOOD_PRODUCTS"}
+
+
+def parse_patient(text: str, client: Optional[Groq] = None) -> dict:
+    """Turn a dispatcher's description into a Patient.
+
+    The model is used as a *parser*, never as a decision-maker: it produces a
+    patient, and the deterministic acceptance function decides where that
+    patient can go. Every field is validated against the real enums and a bad
+    value falls back to the safe default rather than propagating — a
+    hallucinated condition must not reach the clinical rules.
+    """
+    if not text or not text.strip():
+        return {"error": "Describe the patient first."}
+
+    resolved_client = client if client is not None else _default_client()
+    if resolved_client is None:
+        return dict(_UNAVAILABLE)
+
+    try:
+        completion = resolved_client.chat.completions.create(
+            model=_PARSE_MODEL,
+            temperature=0,
+            max_completion_tokens=_PARSE_MAX_TOKENS,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _PARSE_SYSTEM_PROMPT},
+                {"role": "user", "content": text.strip()},
+            ],
+        )
+        raw = json.loads(completion.choices[0].message.content)
+    except Exception:
+        return dict(_UNAVAILABLE)
+
+    if not isinstance(raw, dict):
+        return dict(_UNAVAILABLE)
+
+    acuity = raw.get("acuity")
+    if not isinstance(acuity, int) or not 1 <= acuity <= 5:
+        acuity = 3
+    condition = raw.get("condition")
+    if condition not in _CONDITIONS:
+        condition = "GENERAL"
+    age_group = raw.get("age_group")
+    if age_group not in _AGE_GROUPS:
+        age_group = "ADULT"
+    needs = raw.get("needs")
+    needs = sorted(n for n in needs if n in _NEEDS) if isinstance(needs, list) else []
+    override = raw.get("override")
+    if override not in ("none", "nearest_capable"):
+        override = "none"
+
+    return {
+        "patient": {
+            "acuity": acuity, "condition": condition, "age_group": age_group,
+            "needs": needs, "override": override,
+        }
+    }

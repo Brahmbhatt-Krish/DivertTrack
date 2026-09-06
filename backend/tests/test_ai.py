@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 import dataclasses
+import json
 
 from app import ai
 from app.events import Event, EventType
@@ -204,3 +205,64 @@ def test_explain_uses_the_specified_model_and_temperature() -> None:
     ai.explain(_events(), client=client, cache={})
     assert client.completions.last_kwargs["model"] == ai._EXPLAIN_MODEL
     assert client.completions.last_kwargs["temperature"] == 0.2
+
+
+# -- Phase 23: justify + parse_patient --------------------------------------
+
+
+def test_justify_explains_a_decision_without_influencing_it(monkeypatch) -> None:
+    """It is handed the choice that was already made and the shortlist it came
+    from. It never returns a hospital, so it cannot move a patient."""
+    client = FakeClient('Riverside won: nearest with a free ICU bed. Eastgate was on diversion.')
+    result = ai.justify(
+        "T1", "Hospital_1",
+        {"acuity": 2, "condition": "CARDIAC", "age_group": "ADULT", "needs": [], "override": "none"},
+        [{"hospital_id": "Hospital_1", "score": -2.0, "reason": None},
+         {"hospital_id": "Hospital_2", "score": None, "reason": "on_full_diversion"}],
+        client=client,
+    )
+    assert "Riverside" in result["explanation"]
+    assert "hospital_id" not in result
+
+
+def test_justify_needs_no_network_when_there_are_no_candidates() -> None:
+    assert "No hospitals" in ai.justify("T1", None, {}, [], client=None)["explanation"]
+
+
+def test_parse_patient_validates_every_field_against_the_real_enums() -> None:
+    """A hallucinated condition must not reach the clinical rules: each field
+    falls back to the safe default rather than propagating."""
+    client = FakeClient(json.dumps({
+        "acuity": 99, "condition": "SPACE_FLU", "age_group": "ROBOT",
+        "needs": ["VENTILATOR", "TELEPORTER"], "override": "do_whatever",
+    }))
+    parsed = ai.parse_patient("something odd", client=client)["patient"]
+    assert parsed == {
+        "acuity": 3, "condition": "GENERAL", "age_group": "ADULT",
+        "needs": ["VENTILATOR"], "override": "none",
+    }
+
+
+def test_parse_patient_keeps_valid_values() -> None:
+    client = FakeClient(json.dumps({
+        "acuity": 1, "condition": "CARDIAC", "age_group": "CHILD",
+        "needs": ["CATH_LAB"], "override": "nearest_capable",
+    }))
+    parsed = ai.parse_patient("critical child, cardiac, nearest capable", client=client)["patient"]
+    assert parsed["acuity"] == 1
+    assert parsed["condition"] == "CARDIAC"
+    assert parsed["age_group"] == "CHILD"
+    assert parsed["override"] == "nearest_capable"
+
+
+def test_parse_patient_rejects_empty_text() -> None:
+    assert "error" in ai.parse_patient("   ", client=None)
+
+
+def test_both_new_helpers_fall_back_when_the_model_fails() -> None:
+    """A rate limit or a timeout must never break the demo."""
+    boom = RuntimeError("429 rate limited")
+    assert ai.justify(
+        "T1", "H1", {}, [{"hospital_id": "H1"}], client=FakeClient(error=boom)
+    ) == {"error": "AI unavailable"}
+    assert ai.parse_patient("anything", client=FakeClient(error=boom)) == {"error": "AI unavailable"}

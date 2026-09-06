@@ -3,7 +3,7 @@
 // panel) rather than merged into it, since the two flows don't share a
 // transport id or a hospital set. See the phase report.
 import { useEffect, useState } from "react";
-import { Plus } from "lucide-react";
+import { Plus, Sparkles } from "lucide-react";
 import { api } from "../api.js";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -88,6 +88,24 @@ export default function MultiHospitalControls({ onChanged }) {
 
   const handlePreset = (name) => run(() => api.runPreset(name));
 
+  const [describe, setDescribe] = useState("");
+  const [parsed, setParsed] = useState(null);
+
+  // The model is a parser here, never a decision-maker: it turns the text into
+  // a patient, every field is validated against the real enums server-side,
+  // and the deterministic acceptance function decides where that patient may
+  // go. It is never asked which hospital to use, so it cannot invent one.
+  const handleDescribe = (event) => {
+    event.preventDefault();
+    setParsed(null);
+    return run(async () => {
+      const result = await api.aiDispatch(describe, [Math.random() * 40, Math.random() * 40]);
+      if (result.error) throw new Error(result.error);
+      setParsed(result.patient);
+      setDescribe("");
+    });
+  };
+
   return (
     <Card className="gap-0 py-4">
       <CardHeader className="px-4 pb-3">
@@ -130,6 +148,34 @@ export default function MultiHospitalControls({ onChanged }) {
             ))}
           </div>
         </div>
+
+        <Separator />
+
+        <form onSubmit={handleDescribe} className="space-y-1.5">
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground" htmlFor="ai-describe">
+            <Sparkles className="size-3" />
+            Describe a patient
+          </label>
+          <div className="flex gap-2">
+            <input
+              id="ai-describe"
+              value={describe}
+              onChange={(e) => setDescribe(e.target.value)}
+              placeholder="62-year-old chest pain, critical, needs a cath lab"
+              className="h-8 flex-1 rounded-md border border-border bg-background px-2.5 text-xs"
+            />
+            <Button type="submit" size="xs" disabled={busy || !describe.trim()}>
+              Dispatch
+            </Button>
+          </div>
+          {parsed && (
+            <p className="font-mono text-[11px] text-muted-foreground">
+              acuity {parsed.acuity} · {parsed.condition} · {parsed.age_group}
+              {parsed.needs.length ? ` · ${parsed.needs.join(", ")}` : ""}
+              {parsed.override !== "none" ? ` · ${parsed.override}` : ""}
+            </p>
+          )}
+        </form>
 
         <Separator />
 

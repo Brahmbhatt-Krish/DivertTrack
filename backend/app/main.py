@@ -607,6 +607,66 @@ def ai_recommend(transport_id: str) -> dict:
     )
 
 
+class DescribeRequest(BaseModel):
+    text: str
+    position: tuple[float, float] = (20.0, 20.0)
+
+
+@app.post("/ai/justify/{transport_id}")
+def ai_justify(transport_id: str) -> dict:
+    """Why this hospital, and not the others — narrated from the ranking that
+    actually produced the decision. Explanatory only: it is handed the choice
+    that was already made and never influences it."""
+    state = _state()
+    _require_transport_seen(state, transport_id)
+    patient = state.simulation.dispatcher.patient_of(transport_id)
+    if patient is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transport {transport_id!r} has no patient record to explain",
+        )
+    candidates = [_candidate_view(c) for c in state.simulation.dispatcher.candidates_of(transport_id)]
+    chosen = (
+        state.simulation.dispatcher.current_destination_of(transport_id)
+        or state.simulation.dispatcher.pending_destination_of(transport_id)
+    )
+    return ai.justify(
+        transport_id,
+        chosen,
+        {
+            "acuity": patient.acuity,
+            "condition": patient.condition.value,
+            "age_group": patient.age_group.value,
+            "needs": sorted(n.value for n in patient.needs),
+            "override": patient.override,
+        },
+        candidates,
+    )
+
+
+@app.post("/ai/dispatch")
+def ai_dispatch(body: DescribeRequest) -> dict:
+    """Describe a patient in plain English and dispatch them.
+
+    The model is a *parser* here, never a decision-maker: it produces a
+    patient, every field is validated against the real enums, and the
+    deterministic acceptance function decides where that patient may go. A
+    hallucinated hospital is impossible because the model is never asked for
+    one.
+    """
+    parsed = ai.parse_patient(body.text)
+    if "patient" not in parsed:
+        return parsed  # {"error": ...} — surfaced to the caller as-is
+    state = _state()
+    request = BatchPatientRequest(
+        id=f"AI-{int(state.clock.now_ms())}",
+        position=body.position,
+        **parsed["patient"],
+    )
+    started = state.simulation.start_batch([(_build_patient(request), body.position)])
+    return {"patient": parsed["patient"], "transport_ids": started}
+
+
 # -- live updates ------------------------------------------------------------
 
 

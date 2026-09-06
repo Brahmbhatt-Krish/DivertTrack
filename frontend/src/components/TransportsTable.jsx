@@ -7,7 +7,7 @@
 // ambulance -> hospital mapping went stale on every redirect until you
 // clicked; GET /transports is now just the initial seed.
 import { Fragment, memo, useEffect, useState } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Sparkles } from "lucide-react";
 import { api } from "../api.js";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -35,6 +35,8 @@ function CandidateList({ transportId, arrived }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [why, setWhy] = useState(null);
+  const [explaining, setExplaining] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -107,6 +109,27 @@ function CandidateList({ transportId, arrived }) {
             ? "This patient has arrived — sending them on moves them to another hospital."
             : "Ranked shortlist — higher score wins (distance traded off against load)."}
         </p>
+        {/* Explanatory only: it is handed the decision the ranking already
+            made and never influences it. */}
+        <Button
+          variant="ghost"
+          size="xs"
+          disabled={explaining}
+          onClick={async () => {
+            setExplaining(true);
+            try {
+              const result = await api.justify(transportId);
+              setWhy(result.explanation ?? result.error ?? "No explanation available.");
+            } catch (err) {
+              setWhy(err.message);
+            } finally {
+              setExplaining(false);
+            }
+          }}
+        >
+          <Sparkles className="size-3" />
+          {explaining ? "Thinking…" : "Why here?"}
+        </Button>
         <Button
           variant="outline"
           size="xs"
@@ -117,6 +140,11 @@ function CandidateList({ transportId, arrived }) {
           Re-plan
         </Button>
       </div>
+      {why && (
+        <p className="rounded-md border border-border bg-muted/50 px-3 py-2 text-xs leading-relaxed text-ink-soft text-foreground">
+          {why}
+        </p>
+      )}
       {(candidates ?? []).map((candidate) => {
         const accepted = candidate.score !== null;
         return (
