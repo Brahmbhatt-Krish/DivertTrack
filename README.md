@@ -108,9 +108,11 @@ serves it directly. Note that the UI work departs from the PRD's locked
 dependency list: the operator view uses shadcn/ui, which brings in
 `@radix-ui/*`, `class-variance-authority`, `clsx`, `tailwind-merge` and
 `lucide-react`. Those are presentation-only — no backend dependency was
-added, and nothing in `backend/requirements.txt` changed. `?role=dashboard` (default) shows the full operator
-view; `?role=hospital_A|hospital_B|hospital_C` and `?role=ambulance` show
-single-endpoint views for a multi-screen demo.
+added, and nothing in `backend/requirements.txt` changed.
+
+`?role=` selects the view. `dashboard` (default) is the full operator
+console; `dispatcher`, `hospital_A|hospital_B|hospital_C` and `ambulance`
+are single-endpoint screens — see "One screen per endpoint" below.
 
 ## Deploying
 
@@ -149,14 +151,14 @@ anything else.
 ```
 $ make test
 ...
-241 passed, 2 warnings in 60.69s
+260 passed, 2 warnings in 59.32s
 ```
 
 136 of those predate the multi-hospital extension (Phases 0-11: the
 handoff protocol itself, the API, the frontend's data flow, Phase 10's AI
-sidecar). The rest were added across Phases 12-21 for the extension below,
+sidecar). The rest were added across Phases 12-23 for the extension below,
 including regression tests for each of the defects listed in "What the
-fuzzing actually found". All 241 pass together — the extension's own
+fuzzing actually found". All 260 pass together — the extension's own
 regression requirement ("every pre-existing test must pass unmodified")
 holds.
 
@@ -321,6 +323,108 @@ handoff), so the hub is told about it through a separate, cheap hook:
 `note_movement` refreshes only that ambulance's live view and deliberately
 does *not* enter `_dirty_transports`, which would trigger a replay, a
 projection and an invariant check per transport on every movement tick.
+
+## The bed lifecycle is automatic
+
+A bed is never reserved, released, filled or freed by a human. The four
+transitions are all driven by events the system already emits:
+
+| Moment | What happens to the ledger |
+| --- | --- |
+| Dispatcher commits to a hospital | the required bed type is **reserved** |
+| Redirect, decline, or give-up | that reservation is **released** |
+| Ambulance arrives | reserved becomes **occupied** |
+| Treatment time elapses | the bed is **discharged** back to free |
+
+Which bed type is required is derived from the patient rather than chosen:
+isolation need first, then acuity <= 2 to ICU, then a child or neonate to paediatric,
+otherwise general (`required_bed_type()`). Discharge is scheduled on arrival
+by `Dispatcher._schedule_discharge`, and the stay is scaled by acuity in
+`_treatment_ms` — `treatment_ms * (6 - acuity) / 5`, so acuity 1 occupies a
+bed 5x as long as acuity 5. Without it a hospital only ever fills up: every
+arrival is a permanent occupant and the network deadlocks a few minutes into
+any demo.
+
+What a human still supplies is bed **totals**, and that is deliberate. Only
+the hospital knows how many ICU beds it has staffed today; a system that
+inferred its own would be worse than one that asks. `POST
+/hospitals/{id}/beds` is the seam an HL7/FHIR census feed would attach to,
+and the UI's +/- controls are a stand-in for that feed, not the design.
+
+The default policy is now `AUTO` (`POLICY` env var, `config.py`): the
+dispatcher ranks and commits by itself, and the manual target picker is an
+override rather than the normal path. Under `MANUAL`, a redirect with no
+`target` raises `TargetRequired` and returns 400 — narrowly, so a Pydantic
+`ValidationError` is never mistaken for one and an internal bug cannot be
+laundered into a 4xx.
+
+## The hospital read model
+
+Replaying the log to answer "what is Hospital_3's phone number" is the wrong
+shape of work, so hospital reads are served from real relational tables:
+
+```
+hospitals              hospital_beds          hospital_capabilities
+hospital_specialists   hospital_status        hospital_diverted_categories
+hospital_max_eta       bed_holdings           projection_checkpoint
+```
+
+`readmodel.HospitalReadModel` is a **projector**, not a second source of
+truth. It consumes the same events as everything else, advances a
+checkpoint, and can be dropped and rebuilt from the log at any time —
+`rebuild()` does exactly that, and a test asserts an incrementally-projected
+model matches one rebuilt from scratch. `GET /hospitals` and
+`GET /hospitals/{id}` read it directly with indexes; nothing else in the
+system reads from it, so a bug here can make a screen wrong but cannot make
+a handoff wrong.
+
+It writes through `EventStore.transaction()` — the store's own connection
+and lock — rather than opening its own. A second SQLite connection writing
+the same file inside the store's transaction deadlocks on the writer lock,
+which is a slow and confusing failure to diagnose the second time.
+
+## One screen per endpoint
+
+The dashboard shows every party at once, which is useful for an operator and
+misleading as an explanation: it implies a shared view that does not exist.
+`?role=` gives each endpoint its own screen showing **only its own
+knowledge** — `dispatcher`, `hospital_A|B|C`, `ambulance`.
+
+Open three of them side by side and redirect. The new hospital arms, the
+crew's destination flips, and *only then* does the old hospital stand down —
+each on its own display, in the order the protocol guarantees rather than
+the order a narrator claims. The dispatcher screen deliberately does not
+render the hospitals' internal state; its facility row is labelled as what
+dispatch *believes*, derived from acknowledgements that have arrived, and it
+can lag what a hospital already knows for exactly the length of a handoff.
+
+A newly-connected client cannot replay history it was not present for, so
+the hub sends a snapshot on connect (`_send_snapshot`, marked `{"snapshot":
+true}`) built by projecting the whole log — not by walking `transport_list`,
+which omits transports with no capacity record.
+
+## Two more AI features
+
+Both are additive, both fail closed, and neither can move a patient.
+
+**`POST /ai/justify/{id}`** is handed a placement that has *already* been
+decided, plus the shortlist it came from, and writes the sentence a
+dispatcher would say out loud. Its response has no `hospital_id` field at
+all, so there is no path by which its output could become a destination.
+
+**`POST /ai/dispatch`** uses the model as a **parser**: free text
+("62yo chest pain, critical, needs cath lab") becomes a structured
+`Patient`. Every field is then validated server-side against the real enums,
+and anything unrecognized falls back to a safe default rather than
+propagating. `test_parse_patient_validates_every_field_against_the_real_enums`
+feeds it `condition: "SPACE_FLU"`, `acuity: 99`, `age_group: "ROBOT"` and a
+need called `"TELEPORTER"`, and asserts every one is replaced.
+
+No LLM call sits inside `accept()` or anywhere on the handoff path. Putting
+one there would make the protocol's timing depend on a third party's
+latency, which is precisely the property the rest of this system is built to
+avoid. Every failure mode — no key, rate limit, timeout, malformed JSON —
+returns `{"error": "AI unavailable"}` and leaves the demo working.
 
 ## What the fuzzing actually found
 
