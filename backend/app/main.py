@@ -26,6 +26,7 @@ from app.models import (
 )
 from app.presets import ALL_MULTI_PRESETS, ALL_PRESETS
 from app.projection import FacilityView, TransportView, project_hospitals
+from app.readmodel import HospitalReadModel
 from app.scoring import RankedCandidate
 from app.seed import HOSPITALS, MULTI_HOSPITALS, TRANSPORT
 from app.simulation import Simulation, run_random_fuzz
@@ -48,6 +49,11 @@ class AppState:
         self.clock = RealClock()
         self.simulation = Simulation(self.clock, self.store, config)
         self.hub = Hub()
+        # Relational view of the hospitals, derived from the log. Subscribed
+        # here so it stays current incrementally; rebuilt from scratch at
+        # startup and after a reset. Never written to directly.
+        self.hospitals_db = HospitalReadModel(self.store)
+        self.store.subscribe(self.hospitals_db.apply)
         # (store revision, result) for GET /invariant — see that route.
         self.invariant_cache: Optional[tuple[int, CheckResult]] = None
 
@@ -171,6 +177,9 @@ def _bootstrap_roster(state: "AppState") -> None:
         return
     for hospital in roster.values():
         state.simulation.register_hospital(hospital, log=False)
+    # Replaying an existing roster appends nothing, so the incremental
+    # subscription sees no events — rebuild the tables from the log instead.
+    state.hospitals_db.rebuild()
     # Registration restores *which* hospitals exist; this restores what state
     # they are in (diversion, bed counts). Both have to come from the log or
     # the running system and the invariant checker disagree about history.
@@ -275,9 +284,23 @@ def redirect_transport(transport_id: str, body: RedirectRequest):
 
 
 @app.get("/hospitals")
-def list_hospitals() -> list[dict]:
-    state = _state()
-    return [_hospital_view(state, hospital_id) for hospital_id in state.simulation.hospital_ids()]
+def list_hospitals(include_retired: bool = False) -> list[dict]:
+    """Served from the read-model tables, not by replaying the log.
+
+    project_hospitals()/project_ledger() fold every event on every call, which
+    grows without bound for the life of a deployment; this is an indexed query.
+    The pure replays remain the authoritative derivation the checker uses, and
+    a test asserts the two agree.
+    """
+    return _state().hospitals_db.fetch_all(include_retired=include_retired)
+
+
+@app.get("/hospitals/{hospital_id}")
+def get_hospital(hospital_id: str) -> dict:
+    view = _state().hospitals_db.fetch(hospital_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail=f"Unknown hospital {hospital_id!r}")
+    return view
 
 
 @app.post("/hospitals", status_code=201)
@@ -492,6 +515,7 @@ def demo_reset() -> dict[str, str]:
     # a few stray, ultimately harmless events after reset before settling;
     # a production system would track and cancel those handles explicitly.
     state.simulation = Simulation(state.clock, state.store, state.config)
+    state.hospitals_db.rebuild()  # the log was just cleared
     _bootstrap_roster(state)
     state.simulation.on_movement = state.hub.note_movement
     state.hub.rebind_source(state.simulation)

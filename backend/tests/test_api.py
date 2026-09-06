@@ -432,6 +432,9 @@ def test_redirect_without_a_target_is_allowed_under_auto_policy(client: TestClie
 def test_policy_can_be_read_back(client: TestClient) -> None:
     """POST /policy had no GET counterpart, so a client could set the mode but
     never ask what it was — which is exactly what the Re-plan button needs."""
+    # Set explicitly rather than asserting the default: the deployed default
+    # is auto, and a test that pins it would break the moment it is retuned.
+    client.post("/policy", json={"mode": "manual"})
     assert client.get("/policy").json()["policy"] == "manual"
     client.post("/policy", json={"mode": "auto"})
     assert client.get("/policy").json()["policy"] == "auto"

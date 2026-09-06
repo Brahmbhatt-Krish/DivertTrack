@@ -8,6 +8,7 @@ import dataclasses
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -173,6 +174,20 @@ class EventStore:
                     (transport_id,),
                 ).fetchall()
         return [_row_to_event(row) for row in rows]
+
+    @contextmanager
+    def transaction(self):
+        """Hand the underlying connection out under this store's own lock.
+
+        The read model (readmodel.py) lives in the same SQLite file so there is
+        one database to deploy and one thing to back up — and it must not open
+        a second connection to it, because two writers to one SQLite file
+        deadlock under exactly the concurrency this app has (route handlers on
+        the threadpool, bus deliveries on the event loop). Sharing the lock is
+        what makes that safe.
+        """
+        with self._lock:
+            yield self._conn
 
     def subscribe(self, fn: Callable[[Event], None]) -> None:
         self._subscribers.append(fn)
