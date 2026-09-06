@@ -402,26 +402,30 @@ class Simulation:
         rather than in the route: the two used to be separate and the table
         could only be refreshed by hand, which is exactly the drift this
         avoids."""
-        projection = self.views()
+        # Read from the dispatcher's live state rather than replaying the log.
+        # This runs on every hub flush (the table is pushed live), and views()
+        # replays *and projects the whole log twice* — O(events), which at a
+        # few thousand events was costing ~25ms per flush and climbing without
+        # bound for the length of a session. The rows below are display state
+        # for transports this dispatcher is actively running, so its own
+        # bookkeeping is the right source; the log-derived projection remains
+        # authoritative for the invariant check, which is what actually has to
+        # be independent of the dispatcher.
         rows: list[dict] = []
         for transport_id in self._dispatcher.known_patients():
-            view = projection.transports.get(transport_id)
-            if view is None:
-                continue
             rows.append(
                 {
                     "transport_id": transport_id,
-                    "current_destination": view.current_destination,
-                    "pending_destination": view.pending_destination,
-                    "current_epoch": view.current_epoch,
-                    "status": view.status.value,
+                    "current_destination": self._dispatcher.current_destination_of(transport_id),
+                    "pending_destination": self._dispatcher.pending_destination_of(transport_id),
+                    "current_epoch": self._dispatcher.current_epoch_of(transport_id),
+                    "status": self._dispatcher.status_of(transport_id).value,
                     "position": self._dispatcher.position_of(transport_id),
-                    # The hospital this transport actually reached, once its
-                    # Arrived event has been replayed. DispatcherStatus has no
-                    # ARRIVED member (arrival ends the journey, it isn't a
-                    # handoff state), so this is the only thing that tells a
-                    # transport still driving from one that has landed.
-                    "arrived_at": view.arrived_at,
+                    # DispatcherStatus has no ARRIVED member (arrival ends the
+                    # journey, it isn't a handoff state), so this is the only
+                    # thing that tells a transport still driving from one that
+                    # has landed.
+                    "arrived_at": self._dispatcher.arrived_at_of(transport_id),
                 }
             )
         return rows

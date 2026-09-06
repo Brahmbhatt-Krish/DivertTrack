@@ -165,6 +165,14 @@ class Dispatcher:
     def queued_redirect_of(self, transport_id: str) -> Optional[str]:
         return self._require_transport(transport_id).queued_redirect
 
+    def arrived_at_of(self, transport_id: str) -> Optional[str]:
+        """The hospital this transport reached, or None if it is still in
+        transit. Mirrors TransportView.arrived_at without a replay."""
+        record = self._transports.get(transport_id)
+        if record is None or not record.arrived:
+            return None
+        return record.current_destination
+
     def is_known(self, transport_id: str) -> bool:
         """Whether this dispatcher instance has this transport in its live
         cache — false for a transport that only exists in event history
@@ -359,7 +367,7 @@ class Dispatcher:
         if record.candidate_queue:
             self._try_next_candidate(transport_id, record)
             return
-        self._log(transport_id, record.pending_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": list(record.candidates_tried)})
+        self._log(transport_id, record.pending_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": list(record.candidates_tried), "gave_up": True})
         if record.current_destination is None:
             self._give_up_on_placement(transport_id, record)
         else:
@@ -522,7 +530,7 @@ class Dispatcher:
         self._transports[transport_id] = record
 
         if not candidates:
-            self._log(transport_id, 1, EventType.NO_ACCEPTING_FACILITY, {"tried": []})
+            self._log(transport_id, 1, EventType.NO_ACCEPTING_FACILITY, {"tried": [], "gave_up": True})
             record.status = DispatcherStatus.NO_ACCEPTING_FACILITY
             return
 
@@ -569,7 +577,7 @@ class Dispatcher:
             # Every remaining candidate went stale before we reached it.
             self._log(
                 transport_id, record.pending_epoch, EventType.NO_ACCEPTING_FACILITY,
-                {"tried": list(record.candidates_tried)},
+                {"tried": list(record.candidates_tried), "gave_up": True},
             )
             if record.current_destination is None:
                 self._give_up_on_placement(transport_id, record)
@@ -789,7 +797,7 @@ class Dispatcher:
             return
 
         # R15: candidates exhausted.
-        self._log(transport_id, record.pending_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": list(record.candidates_tried)})
+        self._log(transport_id, record.pending_epoch, EventType.NO_ACCEPTING_FACILITY, {"tried": list(record.candidates_tried), "gave_up": True})
         if record.current_destination is None:
             self._give_up_on_placement(transport_id, record)
         else:

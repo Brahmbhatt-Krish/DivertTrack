@@ -7,6 +7,7 @@ import { memo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
+import { eventText } from "@/lib/eventText.js";
 
 const HIGHLIGHT_LABELS = {
   StaleIgnored: "STALE — IGNORED",
@@ -54,7 +55,10 @@ function Timeline({ events }) {
             <TableBody>
               {rows.map((event) => {
                 const label = HIGHLIGHT_LABELS[event.type];
-                const detail = JSON.stringify(event.payload);
+                // Readable sentence in the column, raw payload on hover —
+                // the precision is still one mouse-over away.
+                const detail = eventText(event);
+                const raw = JSON.stringify(event.payload);
                 const delay =
                   event.type === "CommandSent" && event.payload.command_id in deliveredAt
                     ? deliveredAt[event.payload.command_id] - event.ts_ms
@@ -66,10 +70,7 @@ function Timeline({ events }) {
                       {label ?? event.type}
                     </TableCell>
                     <TableCell className="py-1.5 font-mono text-muted-foreground">{event.facility_id ?? "—"}</TableCell>
-                    <TableCell
-                      className="max-w-xs truncate py-1.5 font-mono text-muted-foreground"
-                      title={detail}
-                    >
+                    <TableCell className="py-1.5 text-muted-foreground" title={raw}>
                       {detail}
                     </TableCell>
                     <TableCell className="py-1.5 text-right font-mono text-muted-foreground">

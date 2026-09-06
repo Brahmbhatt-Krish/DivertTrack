@@ -34,6 +34,12 @@ class TransportViewStatus(str, Enum):
     # replays the log but resumes no timers (E21), so a transport frozen
     # mid-transition needs a reset, not a wait.
     INTERRUPTED = "INTERRUPTED"
+    # Phase 12+: every candidate declined and there was nothing to fall back
+    # to. The projection could not represent this at all, so a transport the
+    # dispatcher had given up on replayed as STARTING toward a hospital it
+    # was never placed at. Matches DispatcherStatus.NO_ACCEPTING_FACILITY,
+    # which the frontend already styles.
+    NO_ACCEPTING_FACILITY = "NO_ACCEPTING_FACILITY"
 
 
 _INTERRUPTIBLE = {DispatcherStatus.STARTING, DispatcherStatus.PREPARING, DispatcherStatus.CUTOVER_SCHEDULED}
@@ -147,6 +153,23 @@ def _apply_transport_event(state: _MutableTransport, event: Event) -> None:
         state.cutover_at = None
         state.status = DispatcherStatus.NOT_READY
         state.queued_redirect = None  # see Dispatcher._abort
+    elif event.type is EventType.NO_ACCEPTING_FACILITY and event.payload.get("gave_up"):
+        # The dispatcher abandoned this placement: every candidate declined
+        # and there was nothing to fall back to. Without this the log replayed
+        # the transport as still STARTING toward a hospital it was never
+        # placed at, so anything rebuilding state from the log alone — a
+        # restart, an audit — disagreed with what actually happened.
+        #
+        # Only the sites that genuinely park the transport carry `gave_up`.
+        # R17 also logs NoAcceptingFacility when it finds no candidate but
+        # keeps the current destination, and that case must not clear
+        # anything, which is why the flag exists rather than the event type
+        # being enough on its own.
+        state.pending_destination = None
+        state.pending_epoch = None
+        state.cutover_at = None
+        state.status = DispatcherStatus.NO_ACCEPTING_FACILITY
+
     elif event.type is EventType.ARRIVED:
         state.arrived_at = event.payload["at"]
 
