@@ -124,8 +124,14 @@ class Config:
             # ~13s, a cross-region one ~30s — enough to redirect in flight.
             sim_time_scale=_read_float("SIM_TIME_SCALE", 45.0),
             min_travel_ms=_read_float("MIN_TRAVEL_MS", 12000.0),
-            # ~8s for a minor case up to ~40s for a critical one.
-            treatment_ms=_read_float("TREATMENT_MS", 8000.0),
+            # ~45s for a minor case up to ~3.75min for a critical one.
+            # Long enough that a demo keeps a populated map and visible
+            # occupancy: at 8s an acuity-3 patient was discharged within five
+            # seconds of arriving, so ambulances vanished almost as fast as
+            # they appeared and it looked like the fleet had been removed.
+            # Mixed acuity still gives visible turnover — the minor cases
+            # cycle while the critical ones hold their beds.
+            treatment_ms=_read_float("TREATMENT_MS", 45000.0),
         )
 
 
