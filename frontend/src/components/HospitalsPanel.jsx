@@ -123,6 +123,13 @@ function HospitalControls({ hospital, onError }) {
 
   return (
     <div className="mt-2 space-y-2 border-t border-border pt-2.5">
+      {/* Named for what it is: these stand in for a hospital's own reporting
+          feed (an HL7/FHIR ADT integration in a real deployment), not for how
+          the system is operated. Everything the dispatcher does with beds —
+          reserving, releasing, rebalancing, discharging — is automatic. */}
+      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
+        Simulate hospital reporting
+      </p>
       <div className="flex items-center gap-1.5">
         <span className="w-20 shrink-0 text-xs text-muted-foreground">diversion</span>
         {DIVERSIONS.map((mode) => (

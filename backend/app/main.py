@@ -568,7 +568,19 @@ def ai_recommend(transport_id: str) -> dict:
     position = ai.AmbulancePosition(
         progress=raw_position["progress"], known_destination=raw_position["known_destination"]
     )
-    return ai.recommend(transport_id, current_epoch, HOSPITALS, TRANSPORT.patient, position)
+    # Live free-bed counts, not the static seed literals: the three legacy
+    # facilities have no bed model, so fall back to their seeded number and
+    # let a capacity-aware hospital of the same name (there is none today,
+    # but the map is the right shape) override it.
+    free_beds = {
+        hospital_id: sum(view["free"].values())
+        for hospital_id in state.simulation.hospital_ids()
+        for view in [state.simulation.hospital_view(hospital_id)]
+        if view is not None
+    }
+    return ai.recommend(
+        transport_id, current_epoch, HOSPITALS, TRANSPORT.patient, position, free_beds=free_beds
+    )
 
 
 # -- live updates ------------------------------------------------------------

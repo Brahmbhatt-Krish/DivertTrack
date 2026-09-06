@@ -507,3 +507,75 @@ def test_discharging_a_patient_frees_the_bed_they_were_in() -> None:
     assert result.passed, result.violations
 
     assert sim.discharge(transport_id) is None, "discharging twice must be a no-op"
+
+
+def test_a_bed_frees_itself_after_treatment() -> None:
+    """Without this a bed only ever fills: arrival occupies it and nothing
+    gives it back, so the network silently saturates and never recovers.
+    Capacity only, exactly like a manual discharge — the transport stays where
+    it is and the facility stays ACTIVE, because being treated is not a
+    handoff."""
+    from dataclasses import replace as _replace
+
+    from app.checker import check
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.seed import MULTI_HOSPITALS
+    from app.simulation import Simulation
+
+    clock, store = _FakeClock(), _EventStore(":memory:")
+    hospitals = {hospital.id: hospital for hospital in MULTI_HOSPITALS}
+    config = _replace(_config(), min_travel_ms=2000.0, treatment_ms=4000.0)
+    sim = Simulation(clock, store, config, hospitals=hospitals)
+    patient = Patient(
+        id="P1", acuity=3, condition=_ConditionCategory.GENERAL, age_group=_AgeGroup.ADULT,
+        needs=frozenset(), override="none",
+    )
+    sim.start_batch([(patient, (18.0, 13.0))])
+    clock.run_until_quiet()
+
+    transport_id = next(iter(sim.dispatcher.known_patients()))
+    landed = sim.dispatcher.arrived_at_of(transport_id)
+    assert landed, "expected the transport to have arrived"
+
+    holders = sim.hospital_view(landed)["holders"]
+    assert not any(
+        transport_id in held["occupied"] or transport_id in held["reserved"]
+        for held in holders.values()
+    ), "the bed was never given back"
+
+    released = [
+        event for event in store.replay(transport_id)
+        if event.type.value == "BedReleased" and event.payload.get("reason") == "discharged"
+    ]
+    assert released, "no discharge was recorded in the log"
+
+    # Nothing about the handoff moved.
+    assert sim.dispatcher.current_destination_of(transport_id) == landed
+    assert check(store.replay(), patients=sim.dispatcher.known_patients()).passed
+
+
+def test_a_sicker_patient_occupies_the_bed_for_longer() -> None:
+    """Stay scales with acuity: acuity 1 gets 5x the base, acuity 5 gets 1x."""
+    from dataclasses import replace as _replace
+
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.simulation import Simulation
+
+    config = _replace(_config(), treatment_ms=1000.0)
+    sim = Simulation(_FakeClock(), _EventStore(":memory:"), config, hospitals={})
+
+    def stay(acuity: int) -> float:
+        return sim.dispatcher._treatment_ms(
+            Patient(id="P", acuity=acuity, condition=_ConditionCategory.GENERAL,
+                    age_group=_AgeGroup.ADULT, needs=frozenset(), override="none")
+        )
+
+    assert stay(1) == 1000.0
+    assert stay(5) == 200.0
+    assert stay(1) > stay(3) > stay(5)

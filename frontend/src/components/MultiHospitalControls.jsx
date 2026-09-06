@@ -2,7 +2,7 @@
 // presets — kept separate from Controls.jsx (the single AMB-101 demo's
 // panel) rather than merged into it, since the two flows don't share a
 // transport id or a hospital set. See the phase report.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Plus } from "lucide-react";
 import { api } from "../api.js";
 import { Button } from "@/components/ui/button";
@@ -18,22 +18,52 @@ const CONDITIONS = ["GENERAL", "CARDIAC", "TRAUMA", "STROKE", "BURN", "RESPIRATO
 // Never reset, so ids stay unique across /demo/reset within a session.
 let patientCounter = 0;
 
+// Weighted like the backend's own generator (seed.random_patient): mostly
+// adults, occasionally a child, rarely a neonate. This used to hardcode
+// ADULT / no needs / no override, which meant PAEDIATRIC and ISOLATION beds
+// could never fill from the UI and the NICU capability and the
+// nearest_capable override were unreachable — half the acceptance logic was
+// undemoable.
+function weighted(choices) {
+  const roll = Math.random();
+  let cumulative = 0;
+  for (const [value, weight] of choices) {
+    cumulative += weight;
+    if (roll < cumulative) return value;
+  }
+  return choices[choices.length - 1][0];
+}
+
+const NEEDS = ["VENTILATOR", "ISOLATION", "CATH_LAB", "CT_SCAN", "BARIATRIC", "BLOOD_PRODUCTS"];
+
 function randomPatient() {
   return {
     id: `WEB-${++patientCounter}`,
     acuity: 1 + Math.floor(Math.random() * 5),
     condition: CONDITIONS[Math.floor(Math.random() * CONDITIONS.length)],
-    age_group: "ADULT",
-    needs: [],
-    override: "none",
+    age_group: weighted([["ADULT", 0.8], ["CHILD", 0.15], ["NEONATE", 0.05]]),
+    needs: NEEDS.filter(() => Math.random() < 0.12),
+    // The escape hatch: skips the transport-window and ED-saturation checks
+    // and ranks on distance alone.
+    override: Math.random() < 0.1 ? "nearest_capable" : "none",
     position: [Math.random() * 40, Math.random() * 40],
   };
 }
 
 export default function MultiHospitalControls({ onChanged }) {
-  const [policy, setPolicyState] = useState("manual");
+  // Read the server's actual mode rather than assuming: the backend now
+  // defaults to auto, and a toggle showing "manual" while the dispatcher is
+  // auto-routing is worse than no toggle.
+  const [policy, setPolicyState] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api
+      .getPolicy()
+      .then(({ policy: mode }) => setPolicyState(mode))
+      .catch(() => setPolicyState("manual"));
+  }, []);
 
   async function run(action) {
     setBusy(true);

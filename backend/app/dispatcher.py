@@ -116,6 +116,7 @@ class _TransportState:
     # Set once the ambulance reports Arrived. The journey is over: the
     # patient is in a bed, so no capacity change may redirect them.
     arrived: bool = False
+    discharge_timer: Optional[Handle] = None
 
 
 class Dispatcher:
@@ -127,6 +128,7 @@ class Dispatcher:
         config: Config,
         hospitals: Optional[dict[str, Hospital]] = None,
         on_no_destination: Optional[Callable[[str, int], None]] = None,
+        on_discharged: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._clock = clock
         self._store = store
@@ -147,6 +149,7 @@ class Dispatcher:
         # ambulance can stop driving toward a hospital that already released
         # its bed — see _give_up_on_placement.
         self._on_no_destination = on_no_destination
+        self._on_discharged = on_discharged
 
     # -- read-only views for tests and the projection layer -----------------
 
@@ -267,6 +270,7 @@ class Dispatcher:
         if record.current_destination == hospital_id and record.current_bed_type is not None:
             self._occupy_bed(transport_id, hospital_id, record.current_bed_type, record.current_epoch)
             record.arrived = True
+            self._schedule_discharge(transport_id, record)
         # else: no live reservation here for this transport — log nothing
         # extra, per spec; checker.py's I3 (Phase 16) is what flags this.
 
@@ -462,6 +466,36 @@ class Dispatcher:
             transport_id, epoch, EventType.BED_RESERVED,
             {"hospital_id": hospital_id, "transport_id": transport_id, "bed_type": bed_type.value},
         )
+
+    def _treatment_ms(self, patient: Patient) -> float:
+        """How long this patient occupies a bed. Scaled by acuity so the sicker
+        the patient the longer the stay: acuity 1 gets 5x the base, acuity 5
+        gets 1x. Not clinically calibrated — it is a plausible shape, and the
+        point is that capacity recovers on its own rather than only ever
+        filling up."""
+        return self._config.treatment_ms * (6 - patient.acuity) / 5.0
+
+    def _schedule_discharge(self, transport_id: str, record: _TransportState) -> None:
+        """Treat, then free the bed — without anyone clicking anything.
+
+        Capacity only, exactly like the manual discharge: the transport stays
+        where it is and the facility stays ACTIVE, because being treated is
+        not a handoff.
+        """
+        if self._config.treatment_ms <= 0 or record.patient is None:
+            return
+        stay_ms = self._treatment_ms(record.patient)
+        record.discharge_timer = self._clock.schedule(
+            int(stay_ms), lambda: self._auto_discharge(transport_id)
+        )
+
+    def _auto_discharge(self, transport_id: str) -> None:
+        record = self._transports.get(transport_id)
+        if record is not None:
+            record.discharge_timer = None
+        freed = self.discharge(transport_id)
+        if freed is not None and self._on_discharged is not None:
+            self._on_discharged(transport_id)
 
     def discharge(self, transport_id: str) -> Optional[tuple[str, BedType]]:
         """The patient was treated and has left: give the bed back.

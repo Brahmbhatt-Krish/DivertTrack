@@ -73,6 +73,7 @@ class Simulation:
         self._dispatcher = Dispatcher(
             clock, store, self._bus, config, hospitals=self._hospitals,
             on_no_destination=self._stand_down_ambulance,
+            on_discharged=self._retire_ambulance,
         )
         self._bus.register_dispatcher(self._dispatcher.on_ack)
         # How many times each multi-preset has been run, so repeat clicks
@@ -239,6 +240,13 @@ class Simulation:
             )
         )
 
+    def _retire_ambulance(self, transport_id: str) -> None:
+        """Auto-discharge finished: the patient is treated and gone, so the
+        ambulance leaves the map exactly as it does on a manual discharge."""
+        ambulance = self._ambulances.pop(transport_id, None)
+        if ambulance is not None:
+            ambulance.stand_down()
+
     def discharge(self, transport_id: str) -> Optional[tuple[str, BedType]]:
         """POST /transports/{id}/discharge — the patient is treated and gone,
         so the bed goes back into the pool and the ambulance leaves the map.
@@ -249,9 +257,7 @@ class Simulation:
         freed = self._dispatcher.discharge(transport_id)
         if freed is None:
             return None
-        ambulance = self._ambulances.pop(transport_id, None)
-        if ambulance is not None:
-            ambulance.stand_down()
+        self._retire_ambulance(transport_id)
         return freed
 
     def report_hospital_status(self, hospital_id: str, changes: dict) -> None:

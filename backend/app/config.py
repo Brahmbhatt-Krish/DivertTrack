@@ -92,6 +92,15 @@ class Config:
     # 0.0 here so tests keep their exact existing tick counts; from_env picks
     # the demo value.
     min_travel_ms: float = 0.0
+    # How long a patient occupies a bed before being discharged automatically,
+    # for the *least* critical case; scaled up by acuity (see
+    # Dispatcher._treatment_ms). Without it a bed only ever fills — arrival
+    # occupies it and nothing gives it back — so the network silently
+    # saturates and never recovers.
+    #
+    # 0.0 disables it, which is the default here so tests keep their exact
+    # timelines; from_env turns it on for the demo.
+    treatment_ms: float = 0.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -106,12 +115,17 @@ class Config:
             speed_km_per_min=_read_float("SPEED_KM_PER_MIN", 1.0),
             load_weight=_read_float("LOAD_WEIGHT", 10.0),
             saturation_limit=_read_float("SATURATION_LIMIT", 0.9),
-            policy=Policy(os.environ.get("POLICY", "manual")),
+            # AUTO by default: the whole point of the capacity layer is that
+            # it re-routes on its own when a hospital diverts or loses beds,
+            # and MANUAL hides that behind a toggle nobody thinks to flip.
+            policy=Policy(os.environ.get("POLICY", "auto")),
             # 60x: a typical 10-15 km transport lands in ~10-15 seconds.
             # 45x + a 12s floor: short hops take ~12s, a 10 km transport
             # ~13s, a cross-region one ~30s — enough to redirect in flight.
             sim_time_scale=_read_float("SIM_TIME_SCALE", 45.0),
             min_travel_ms=_read_float("MIN_TRAVEL_MS", 12000.0),
+            # ~8s for a minor case up to ~40s for a critical one.
+            treatment_ms=_read_float("TREATMENT_MS", 8000.0),
         )
 
 

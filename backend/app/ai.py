@@ -128,11 +128,23 @@ def explain(events: list[Event], client: Optional[Groq] = None, cache: Optional[
 _recommend_cache: dict[tuple[str, int], dict] = {}
 
 
-def _validate_ranked(raw: Any, hospitals: Sequence[HospitalSeed]) -> list[dict]:
+def _validate_ranked(
+    raw: Any, hospitals: Sequence[HospitalSeed], free_beds: Optional[dict[str, int]] = None
+) -> list[dict]:
     if not isinstance(raw, dict) or not isinstance(raw.get("ranked"), list):
         raise ValueError(f"expected a JSON object with a 'ranked' list, received {raw!r}")
 
-    beds_by_id = {h.facility_id: h.beds_available for h in hospitals}
+    # beds_available on HospitalSeed is a *static literal* from seed.py that
+    # the simulation never updates, so validating against it rejected picks at
+    # hospitals that really did have beds and accepted picks at hospitals that
+    # did not. The caller passes live counts instead; the seed value is only a
+    # fallback for the plain demo, which has no bed model at all.
+    beds_by_id = {
+        h.facility_id: (
+            free_beds.get(h.facility_id, h.beds_available) if free_beds is not None else h.beds_available
+        )
+        for h in hospitals
+    }
     validated: list[dict] = []
     for entry in raw["ranked"]:
         if not isinstance(entry, dict):
@@ -156,6 +168,7 @@ def recommend(
     position: AmbulancePosition,
     client: Optional[Groq] = None,
     cache: Optional[dict] = None,
+    free_beds: Optional[dict[str, int]] = None,
 ) -> dict:
     cache = _recommend_cache if cache is None else cache
     key = (transport_id, current_epoch)
@@ -187,7 +200,7 @@ def recommend(
         )
         text = completion.choices[0].message.content
         data = json.loads(text)
-        ranked = _validate_ranked(data, hospitals)
+        ranked = _validate_ranked(data, hospitals, free_beds)
     except Exception:
         return dict(_UNAVAILABLE)
 
