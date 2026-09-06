@@ -146,3 +146,38 @@ def test_real_clock_cancel_prevents_the_callback_from_running() -> None:
         assert ran == []
     finally:
         loop.close()
+
+
+def test_real_clock_cancels_a_handle_from_any_event_loop() -> None:
+    """uvloop returns its own TimerHandle from call_later, and it is *not* a
+    subclass of asyncio.TimerHandle. Type-checking against that concrete class
+    passed every test and every Windows dev run, then raised TypeError on the
+    first redirect inside the Linux container, where uvicorn[standard] installs
+    uvloop. The contract is "something cancellable", so check for that.
+    """
+    from app.clock import RealClock
+
+    class ForeignTimerHandle:
+        """Stands in for uvloop.loop.TimerHandle: cancellable, unrelated type."""
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    clock = RealClock(loop=asyncio.new_event_loop())
+    handle = ForeignTimerHandle()
+    clock.cancel(handle)
+    assert handle.cancelled
+
+
+def test_real_clock_still_rejects_a_fake_clock_handle() -> None:
+    """The type check's real job: catching a FakeClock handle handed to a
+    RealClock, which is a genuine programming error."""
+    from app.clock import RealClock
+
+    fake = FakeClock()
+    handle = fake.schedule(10, lambda: None)
+    with pytest.raises(TypeError):
+        RealClock(loop=asyncio.new_event_loop()).cancel(handle)

@@ -106,7 +106,17 @@ class RealClock:
         return self._loop.call_later(delay_ms / 1000, fn)
 
     def cancel(self, handle: Handle) -> None:
-        if not isinstance(handle, asyncio.TimerHandle):
+        # Duck-typed, not isinstance(handle, asyncio.TimerHandle): uvloop —
+        # which uvicorn[standard] installs on Linux but not on Windows —
+        # returns its own uvloop.loop.TimerHandle from call_later, and that is
+        # not a subclass of asyncio.TimerHandle. The isinstance check
+        # therefore passed every test and every local run and blew up only
+        # inside the Linux container, on the first redirect.
+        #
+        # The check still earns its place: its real job is catching a
+        # FakeClock handle handed to a RealClock, which is a genuine
+        # programming error and stays rejected below.
+        if isinstance(handle, _ScheduledCall) or not callable(getattr(handle, "cancel", None)):
             raise TypeError(
                 f"Expected a handle returned by RealClock.schedule, received {handle!r}"
             )
