@@ -72,7 +72,13 @@ export function reduce(state, message) {
         },
       };
 
-    case "ambulance":
+    case "ambulance": {
+      if (message.removed) {
+        // Discharged and retired — drop it so its marker leaves the map and
+        // the fleet list, rather than freezing at its last known position.
+        const { [message.transport_id]: _gone, ...rest } = state.ambulances;
+        return { ...state, ambulances: rest };
+      }
       return {
         ...state,
         ambulances: {
@@ -85,6 +91,7 @@ export function reduce(state, message) {
           [message.transport_id]: (({ kind, transport_id, ...view }) => view)(message),
         },
       };
+    }
 
     case "invariant":
       return {

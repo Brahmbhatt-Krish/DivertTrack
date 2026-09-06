@@ -239,6 +239,21 @@ class Simulation:
             )
         )
 
+    def discharge(self, transport_id: str) -> Optional[tuple[str, BedType]]:
+        """POST /transports/{id}/discharge — the patient is treated and gone,
+        so the bed goes back into the pool and the ambulance leaves the map.
+
+        The transport record itself stays: it is the history of a journey that
+        really happened, and the log has to keep describing it. Only the live
+        ambulance goes."""
+        freed = self._dispatcher.discharge(transport_id)
+        if freed is None:
+            return None
+        ambulance = self._ambulances.pop(transport_id, None)
+        if ambulance is not None:
+            ambulance.stand_down()
+        return freed
+
     def report_hospital_status(self, hospital_id: str, changes: dict) -> None:
         """Phase 17's POST /hospitals/{id}/status."""
         event = self._store.append(

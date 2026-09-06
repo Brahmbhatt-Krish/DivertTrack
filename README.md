@@ -112,6 +112,38 @@ added, and nothing in `backend/requirements.txt` changed. `?role=dashboard` (def
 view; `?role=hospital_A|hospital_B|hospital_C` and `?role=ambulance` show
 single-endpoint views for a multi-screen demo.
 
+## Deploying
+
+One image, one origin. The frontend is built into `frontend/dist` and served by
+the same FastAPI process that serves the API — which is why there is no CORS
+middleware and no API base URL anywhere in the client: `api.js` uses relative
+paths and `ws.js` derives the WebSocket URL from `window.location`, so both
+resolve to whatever host the container is reachable at. Splitting the two
+across hosts would require adding all three.
+
+```bash
+railway login
+railway link          # pick or create the project
+railway up            # builds the Dockerfile and deploys
+```
+
+Then set `GROQ_API_KEY` in the service's variables (never in the image) — the
+AI panel degrades to "AI unavailable" without it and nothing else is affected.
+
+Two deployment facts worth knowing:
+
+- **`numReplicas` is 1, and must stay 1.** Every dispatcher, facility and
+  ambulance lives in one process alongside its SQLite log; a second replica
+  would be a second, independent simulation behind the same URL.
+- **The log is ephemeral** (`DB_PATH=/tmp/diverttrack.db`). Every redeploy
+  comes back to the seeded six hospitals with an empty log. For a demo that is
+  the desired behaviour, not a limitation to work around.
+
+There is **no authentication**. Anyone with the URL can start transports,
+retire hospitals and reset the demo, and all visitors share one simulation.
+That is fine for a short-lived demo behind an unlisted link and unsuitable for
+anything else.
+
 ## Test output
 
 ```

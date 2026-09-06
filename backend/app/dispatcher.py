@@ -463,16 +463,54 @@ class Dispatcher:
             {"hospital_id": hospital_id, "transport_id": transport_id, "bed_type": bed_type.value},
         )
 
-    def _release_bed(self, transport_id: str, hospital_id: str, bed_type: BedType, epoch: int) -> None:
+    def discharge(self, transport_id: str) -> Optional[tuple[str, BedType]]:
+        """The patient was treated and has left: give the bed back.
+
+        Deliberately touches capacity bookkeeping only — the transport stays
+        where it is and the facility stays ACTIVE, so the handoff invariant is
+        untouched. Discharging is not a handoff, and making it one would mean
+        a cured patient briefly had no hospital, which is exactly the state
+        I1 exists to forbid.
+
+        Returns the (hospital, bed type) freed, or None if this transport
+        wasn't holding a bed anywhere.
+        """
+        record = self._transports.get(transport_id)
+        if record is None:
+            return None
+        # Only a bed the patient is actually *in*. A merely reserved bed
+        # belongs to a handshake still in flight, and taking it back is a
+        # redirect or an abort — not a discharge; doing it here would strand
+        # the transport mid-protocol.
+        for hospital_id, entry in self._ledger.items():
+            for bed_type, ids in entry.occupied.items():
+                if transport_id in ids:
+                    self._release_bed(
+                        transport_id, hospital_id, bed_type, record.current_epoch, reason="discharged"
+                    )
+                    if record.current_destination == hospital_id:
+                        record.current_bed_type = None
+                    return hospital_id, bed_type
+        return None
+
+    def _release_bed(
+        self, transport_id: str, hospital_id: str, bed_type: BedType, epoch: int, reason: Optional[str] = None
+    ) -> None:
         entry = self._ledger.setdefault(hospital_id, _LedgerEntry())
         for ids in entry.reserved.values():
             ids.discard(transport_id)
+        # Occupancy too. Every caller today releases a bed that was only ever
+        # reserved, so this is a no-op for them — but it was the asymmetry
+        # that made a released occupied bed stay held, and the mirror must
+        # mean exactly what BedReleased means on replay.
+        for ids in entry.occupied.values():
+            ids.discard(transport_id)
         entry.ventilator_holders.discard(transport_id)
         entry.reserved_order.pop(transport_id, None)
-        self._log(
-            transport_id, epoch, EventType.BED_RELEASED,
-            {"hospital_id": hospital_id, "transport_id": transport_id, "bed_type": bed_type.value},
-        )
+        payload = {"hospital_id": hospital_id, "transport_id": transport_id, "bed_type": bed_type.value}
+        if reason is not None:
+            payload["reason"] = reason
+        self._log(transport_id, epoch, EventType.BED_RELEASED, payload)
 
     def _occupy_bed(self, transport_id: str, hospital_id: str, bed_type: BedType, epoch: int) -> None:
         entry = self._ledger.setdefault(hospital_id, _LedgerEntry())
@@ -648,6 +686,13 @@ class Dispatcher:
             self._queue_redirect(transport_id, record, target)
 
     def _redirect_capacity_aware(self, transport_id: str, record: _TransportState, target: Optional[str]) -> None:
+        # Redirecting a transport that has already arrived is allowed: an
+        # operator moving a patient on to another hospital is a real thing to
+        # want, and the ledger now handles it correctly (_release_bed gives
+        # back an occupancy, not just a reservation, so the hospital they
+        # leave stops counting the bed). Only the *automatic* paths refuse to
+        # touch an arrived transport — a capacity wobble must not move a
+        # patient who is already in a bed; see _recheck_current_destination.
         """R13/R15/R17/R20. Mirrors _redirect_plain's R1/R6/R8/R9 branching
         exactly (a capacity-aware transport is still bound by the same
         epoch/cancellable rules), but the "new pending target" is resolved

@@ -11,3 +11,4 @@ dist/
 .idea/
 Thumbs.db
 *.log
+frontend/dist

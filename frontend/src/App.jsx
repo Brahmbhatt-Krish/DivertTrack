@@ -47,7 +47,13 @@ export default function App() {
     return (
       <div className="flex min-h-screen items-center justify-center p-8">
         <div className="w-full max-w-md">
-          <FacilityCard facilityId={facilityId} view={view} events={state.timeline} large />
+          <FacilityCard
+            facilityId={facilityId}
+            view={view}
+            events={state.timeline}
+            arrivedAt={transportView?.arrived_at ?? null}
+            large
+          />
         </div>
       </div>
     );
@@ -83,6 +89,7 @@ export default function App() {
                 facilityId={facilityId}
                 view={state.facilities[facilityKey(facilityId, DEMO_TRANSPORT_ID)]}
                 events={state.timeline}
+                arrivedAt={transportView?.arrived_at ?? null}
               />
             ))}
           </div>
@@ -117,7 +124,10 @@ export default function App() {
           <MultiHospitalControls onChanged={bumpRefresh} />
           <HospitalsPanel hospitals={state.hospitals} />
 
-          <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+          {/* No items-start here: these two are meant to be the same height,
+              and the map's is the one that sets it (a square capped at 320px).
+              The fleet list scrolls inside whatever height the row gives it. */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <RegionMap hospitals={state.hospitals} ambulances={state.ambulances} />
             <AmbulanceFleet ambulances={state.ambulances} transportRows={state.transportRows} />
           </div>

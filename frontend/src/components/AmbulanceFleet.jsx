@@ -94,8 +94,12 @@ function AmbulanceFleet({ ambulances, transportRows }) {
   const enRoute = entries.filter(([, a]) => !a.arrived && a.known_destination).length;
   const stranded = entries.filter(([, a]) => !a.arrived && !a.known_destination).length;
 
+  // max-h matches the region map's natural height (a 320px square plus its
+  // header and legend), so the two cards beside each other come out equal:
+  // the map sets the row and a long fleet list scrolls inside it instead of
+  // towering over it. Bounded on narrow screens too, where they stack.
   return (
-    <Card className="gap-0 py-0">
+    <Card className="flex max-h-[420px] flex-col gap-0 py-0">
       <CardHeader className="border-b border-border px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -118,8 +122,10 @@ function AmbulanceFleet({ ambulances, transportRows }) {
         </div>
       </CardHeader>
 
-      <CardContent className="px-0">
-        <div className="max-h-[352px] overflow-y-auto">
+      {/* min-h-0 lets the scroll area actually shrink inside the flex column
+          — without it the list forces the card taller than its row. */}
+      <CardContent className="min-h-0 flex-1 px-0">
+        <div className="h-full overflow-y-auto">
           {entries.length === 0 ? (
             <p className="px-4 py-8 text-center text-sm text-muted-foreground">
               No ambulances yet — start a transport or run a scenario preset.

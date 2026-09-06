@@ -372,3 +372,138 @@ def test_the_last_bed_is_still_only_given_to_one_transport() -> None:
     assert len(placed) == 1, f"one bed, but {len(placed)} transports placed: {placed}"
     result = check(store.replay(), patients=sim.dispatcher.known_patients())
     assert not [v for v in result.violations if v.kind.value == "OVERBOOKED"], result.violations
+
+
+def test_releasing_a_bed_gives_back_an_occupied_one_too() -> None:
+    """BedReleased means "this transport no longer holds a bed here". Both the
+    dispatcher's live mirror and project_ledger only ever discarded the
+    *reservation*, so a released occupied bed stayed counted against the
+    hospital for the rest of the log — the old hospital kept showing a bed in
+    use after the patient had gone."""
+    from app.events import Event as _Event
+    from app.events import EventStore as _EventStore
+    from app.events import EventType as _EventType
+    from app.models import BedType as _BedType
+    from app.projection import project_ledger
+
+    store = _EventStore(":memory:")
+    for event_type in (_EventType.BED_RESERVED, _EventType.BED_OCCUPIED, _EventType.BED_RELEASED):
+        store.append(
+            _Event(
+                transport_id="T1", epoch=1, ts_ms=0, type=event_type, facility_id="H1",
+                payload={"hospital_id": "H1", "transport_id": "T1", "bed_type": _BedType.ICU.value},
+            )
+        )
+
+    view = project_ledger(store.replay(), {})["H1"]
+    assert "T1" not in view.occupied.get(_BedType.ICU, frozenset()), "released bed still counted as occupied"
+    assert "T1" not in view.reserved.get(_BedType.ICU, frozenset())
+
+
+def test_redirecting_an_arrived_transport_frees_the_bed_it_leaves() -> None:
+    """An operator moving a patient on to another hospital is a real thing to
+    want, so this is allowed. What must not happen is the hospital they leave
+    going on counting the bed: _release_bed only ever gave back a
+    *reservation*, so a redirect after arrival left the old hospital's bed
+    occupied forever.
+    """
+    from dataclasses import replace as _replace
+
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.seed import MULTI_HOSPITALS
+    from app.simulation import Simulation
+
+    clock, store = _FakeClock(), _EventStore(":memory:")
+    hospitals = {hospital.id: hospital for hospital in MULTI_HOSPITALS}
+    # A real journey, not a zero-distance one: a patient generated on the
+    # hospital's own coordinates arrives on the first tick, before the
+    # handshake has even placed them, so the dispatcher never records the
+    # arrival at all. min_travel_ms is what stops that in the running app.
+    sim = Simulation(clock, store, _replace(_config(), min_travel_ms=2000.0), hospitals=hospitals)
+    patient = Patient(
+        id="P1", acuity=2, condition=_ConditionCategory.GENERAL, age_group=_AgeGroup.ADULT,
+        needs=frozenset(), override="none",
+    )
+    sim.start_batch([(patient, (18.0, 13.0))])
+    clock.run_until_quiet()
+
+    transport_id = next(iter(sim.dispatcher.known_patients()))
+    landed = sim.dispatcher.arrived_at_of(transport_id)
+    assert landed, "expected the transport to have arrived"
+
+    def holds(hospital_id: str) -> bool:
+        holders = sim.hospital_view(hospital_id)["holders"]
+        return any(
+            transport_id in held["reserved"] or transport_id in held["occupied"]
+            for held in holders.values()
+        )
+
+    assert holds(landed)
+    elsewhere = next(
+        hospital_id
+        for hospital_id in hospitals
+        if hospital_id != landed and sim.dispatcher.hospital_status_of(hospital_id) is not None
+    )
+    sim.redirect(transport_id, elsewhere)
+    clock.run_until_quiet()
+
+    assert sim.dispatcher.current_destination_of(transport_id) == elsewhere
+    assert not holds(landed), f"{landed} is still holding a bed for a patient that left"
+    assert holds(elsewhere)
+
+
+def test_discharging_a_patient_frees_the_bed_they_were_in() -> None:
+    """A treated patient leaves and their bed goes back into the pool.
+
+    Capacity only: the transport stays where it is and the facility stays
+    ACTIVE. Discharging is not a handoff — routing it through one would mean a
+    cured patient briefly had no hospital at all, which is the exact state I1
+    exists to forbid.
+    """
+    from dataclasses import replace as _replace
+
+    from app.checker import check
+    from app.clock import FakeClock as _FakeClock
+    from app.events import EventStore as _EventStore
+    from app.models import AgeGroup as _AgeGroup
+    from app.models import ConditionCategory as _ConditionCategory
+    from app.seed import MULTI_HOSPITALS
+    from app.simulation import Simulation
+
+    clock, store = _FakeClock(), _EventStore(":memory:")
+    hospitals = {hospital.id: hospital for hospital in MULTI_HOSPITALS}
+    sim = Simulation(clock, store, _replace(_config(), min_travel_ms=2000.0), hospitals=hospitals)
+    patient = Patient(
+        id="P1", acuity=2, condition=_ConditionCategory.GENERAL, age_group=_AgeGroup.ADULT,
+        needs=frozenset(), override="none",
+    )
+    sim.start_batch([(patient, (18.0, 13.0))])
+    clock.run_until_quiet()
+
+    transport_id = next(iter(sim.dispatcher.known_patients()))
+    landed = sim.dispatcher.arrived_at_of(transport_id)
+    assert landed, "expected the transport to have arrived"
+
+    def occupies(hospital_id: str) -> bool:
+        holders = sim.hospital_view(hospital_id)["holders"]
+        return any(transport_id in held["occupied"] for held in holders.values())
+
+    assert occupies(landed)
+    free_before = sim.hospital_view(landed)["free"]
+
+    freed = sim.discharge(transport_id)
+    assert freed is not None and freed[0] == landed
+    assert not occupies(landed), "the bed was not given back"
+    free_after = sim.hospital_view(landed)["free"]
+    assert free_after[freed[1].value] == free_before[freed[1].value] + 1
+
+    # The transport is a record of a journey, not a live claim on a bed.
+    assert sim.dispatcher.current_destination_of(transport_id) == landed
+    # And nothing about the handoff invariant moved.
+    result = check(store.replay(), patients=sim.dispatcher.known_patients())
+    assert result.passed, result.violations
+
+    assert sim.discharge(transport_id) is None, "discharging twice must be a no-op"

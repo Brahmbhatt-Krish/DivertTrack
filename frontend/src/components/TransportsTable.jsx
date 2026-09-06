@@ -30,7 +30,7 @@ const ARRIVED_STYLE = "border-primary/30 bg-primary/10 text-foreground";
 // this patient, best score first, with a reason on the ones it ruled out.
 // Fetched on demand rather than pushed: it's a what-if ranking recomputed
 // against current capacity, not part of the transport's state.
-function CandidateList({ transportId }) {
+function CandidateList({ transportId, arrived }) {
   const [candidates, setCandidates] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -103,7 +103,9 @@ function CandidateList({ transportId }) {
       )}
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">
-          Ranked shortlist — higher score wins (distance traded off against load).
+          {arrived
+            ? "This patient has arrived — sending them on moves them to another hospital."
+            : "Ranked shortlist — higher score wins (distance traded off against load)."}
         </p>
         <Button
           variant="outline"
@@ -243,7 +245,7 @@ function TransportsTable({ rows, onFocus }) {
                     {isOpen && (
                       <TableRow className="hover:bg-transparent">
                         <TableCell colSpan={7} className="bg-muted/30 p-0">
-                          <CandidateList transportId={row.transport_id} />
+                          <CandidateList transportId={row.transport_id} arrived={!!row.arrived_at} />
                         </TableCell>
                       </TableRow>
                     )}

@@ -9,6 +9,11 @@ const STATE_STYLES = {
   ARMED: "border-warning-border bg-warning-soft text-warning",
   ACTIVE: "border-success-border bg-success-soft text-success",
   WITHDRAWN: "border-border bg-muted text-muted-foreground",
+  // Not a FacilityState. The protocol has four states and arrival is not one
+  // of them — a hospital the patient has reached is still ACTIVE, and adding
+  // a fifth state would ripple through the transition table and the checker.
+  // This is a display label for "ACTIVE, and the ambulance is here".
+  ARRIVED: "border-primary/30 bg-primary/10 text-foreground",
 };
 
 const ACCEPTED_TYPES = new Set(["FacilityStateChanged"]);
@@ -28,10 +33,15 @@ function describe(event) {
   return action ? `${event.type} (${action})` : event.type;
 }
 
-export default function FacilityCard({ facilityId, view, events, large = false }) {
+export default function FacilityCard({ facilityId, view, events, arrivedAt = null, large = false }) {
   const state = view?.state ?? "IDLE";
   const epoch = view?.epoch ?? 0;
   const stale = view?.stale ?? false;
+  // Only the hospital the ambulance actually reached, and only while it is
+  // still the active one — a facility that has since been withdrawn from
+  // should not keep claiming the patient.
+  const arrived = arrivedAt === facilityId && state === "ACTIVE";
+  const badge = arrived ? "ARRIVED" : state;
 
   const lastAccepted = lastMatching(events, facilityId, (e) => ACCEPTED_TYPES.has(e.type));
   const lastRejected = lastMatching(events, facilityId, (e) => REJECTED_TYPES.has(e.type));
@@ -48,8 +58,12 @@ export default function FacilityCard({ facilityId, view, events, large = false }
           )}
         </div>
         <div className="mt-2 flex items-center gap-2">
-          <Badge variant="outline" className={cn("font-medium", STATE_STYLES[state] ?? STATE_STYLES.IDLE)}>
-            {state}
+          <Badge
+            variant="outline"
+            className={cn("font-medium", STATE_STYLES[badge] ?? STATE_STYLES.IDLE)}
+            title={arrived ? "The ambulance has arrived. The facility itself is still ACTIVE." : undefined}
+          >
+            {badge}
           </Badge>
           <span className="text-xs text-muted-foreground">epoch {epoch}</span>
         </div>

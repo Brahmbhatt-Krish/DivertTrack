@@ -281,6 +281,11 @@ def _apply_bed_released(mutable: dict[str, _MutableLedger], event: Event) -> Non
     ledger = mutable.setdefault(hospital_id, _MutableLedger())
     for ids in ledger.reserved.values():
         ids.discard(transport_id)
+    # Occupancy too — BedReleased means "this transport no longer holds a bed
+    # here", and dropping only the reservation left a released occupied bed
+    # counted against the hospital for the rest of the log.
+    for ids in ledger.occupied.values():
+        ids.discard(transport_id)
     ledger.ventilator_holders.discard(transport_id)
 
 

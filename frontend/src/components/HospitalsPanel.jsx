@@ -11,7 +11,7 @@
 // acceptance checks (diversion, bed availability, ED saturation) by hand
 // instead of waiting for a scenario preset to happen to trigger them.
 import { memo, useEffect, useState } from "react";
-import { Plus, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Plus, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { api } from "../api.js";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -20,7 +20,7 @@ import { cn } from "@/lib/utils";
 
 const DIVERSIONS = ["OPEN", "PARTIAL", "FULL"];
 
-function CapacityBar({ bedType, total, free, holders, diversion }) {
+function CapacityBar({ bedType, total, free, holders, diversion, onDischarge }) {
   const used = total - free;
   const pct = total > 0 ? Math.round((used / total) * 100) : 0;
   // A hospital on diversion cannot take a patient however many beds are free,
@@ -70,18 +70,35 @@ ${title}` : ""}` : title || undefined}
         </span>
       </div>
       {used > 0 && (
-        <p className="mt-0.5 truncate pl-[5.5rem] text-[11px] text-muted-foreground/80" title={title || undefined}>
-          {reserved.map((id) => (
-            <span key={id} className="mr-1.5 font-mono" title="reserved — ambulance en route">
-              {id}
+        <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0.5 pl-[5.5rem] text-[11px]">
+          {[
+            // Only an occupied bed can be discharged: a reservation belongs to
+            // a handshake still in flight, and taking it back is a redirect,
+            // not a discharge.
+            ...reserved.map((id) => [id, "reserved — ambulance en route", false]),
+            ...occupied.map((id) => [id, "occupied — patient arrived", true]),
+          ].map(([id, hint, isOccupied]) => (
+            <span key={id} className="inline-flex items-center gap-0.5" title={hint}>
+              <span className={cn("font-mono", isOccupied ? "font-medium text-foreground" : "text-muted-foreground/80")}>
+                {id}
+              </span>
+              {/* Discharge: the patient was treated and left, so the bed goes
+                  back. Capacity only — the transport and its hospital are
+                  untouched, since being cured is not a handoff. */}
+              {isOccupied && (
+              <button
+                type="button"
+                aria-label={`Discharge ${id}`}
+                title={`Discharge ${id} — frees this ${bedType} bed`}
+                onClick={() => onDischarge?.(id)}
+                className="rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-danger-soft hover:text-danger focus-visible:outline focus-visible:outline-2 focus-visible:outline-danger"
+              >
+                <X className="size-3" />
+              </button>
+              )}
             </span>
           ))}
-          {occupied.map((id) => (
-            <span key={id} className="mr-1.5 font-mono font-medium text-foreground" title="occupied — patient arrived">
-              {id}
-            </span>
-          ))}
-        </p>
+        </div>
       )}
     </div>
   );
@@ -405,6 +422,12 @@ function HospitalsPanel({ hospitals }) {
                     free={h.free?.[bedType] ?? total}
                     holders={h.holders?.[bedType]}
                     diversion={h.diversion}
+                    onDischarge={(transportId) =>
+                      api.discharge(transportId).then(
+                        () => setError(null),
+                        (err) => setError(err.message),
+                      )
+                    }
                   />
                 ))}
 

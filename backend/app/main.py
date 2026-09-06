@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app import ai
@@ -370,6 +372,23 @@ def start_batch(body: BatchStartRequest) -> dict:
     return {"transport_ids": started}
 
 
+@app.post("/transports/{transport_id}/discharge")
+def discharge_transport(transport_id: str) -> dict:
+    """Free the bed a treated patient was in. Capacity only — the transport
+    stays where it is and the facility stays ACTIVE, so nothing about the
+    handoff invariant changes."""
+    state = _state()
+    _require_transport_seen(state, transport_id)
+    freed = state.simulation.discharge(transport_id)
+    if freed is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transport {transport_id!r} has no patient in a bed to discharge",
+        )
+    hospital_id, bed_type = freed
+    return {"discharged": transport_id, "hospital_id": hospital_id, "bed_type": bed_type.value}
+
+
 @app.get("/transports/{transport_id}/candidates")
 def get_candidates(transport_id: str) -> list[dict]:
     state = _state()
@@ -564,3 +583,39 @@ async def events_live(websocket: WebSocket) -> None:
             await websocket.receive_text()  # clients don't send anything; this just detects disconnects
     except WebSocketDisconnect:
         state.hub.disconnect(websocket)
+
+
+# -- serving the built frontend (production only) ----------------------------
+#
+# Registered last, deliberately: this mounts a catch-all at "/", and FastAPI
+# matches routes in declaration order, so every API route and the WebSocket
+# above already wins. In development nothing is built and this is skipped —
+# Vite serves the app and proxies here instead.
+#
+# Same origin is the whole point: api.js uses relative paths and ws.js derives
+# the WebSocket URL from window.location, so serving both from one process
+# needs no CORS, no base-URL configuration, and no second deployment.
+
+_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_frontend(full_path: str) -> FileResponse:
+    """Serve the built SPA, falling back to index.html for client-side routes.
+
+    A path that looks like an API call is 404'd rather than answered with
+    index.html: returning HTML with a 200 to a fetch() that expected JSON
+    turns a simple "unknown route" into a confusing parse error at the caller.
+    """
+    if not _FRONTEND_DIST.is_dir():
+        raise HTTPException(status_code=404, detail="Frontend is not built (run: npm run build)")
+
+    candidate = (_FRONTEND_DIST / full_path).resolve()
+    # Containment check: a crafted path must not read outside dist/.
+    if full_path and _FRONTEND_DIST in candidate.parents and candidate.is_file():
+        return FileResponse(candidate)
+
+    index = _FRONTEND_DIST / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=404, detail="Frontend is not built (run: npm run build)")
+    return FileResponse(index)

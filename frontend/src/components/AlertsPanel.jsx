@@ -4,6 +4,15 @@ import { memo } from "react";
 import { Bell, TriangleAlert } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { eventText } from "@/lib/eventText.js";
+
+// The event-type name as a heading. These are the three kinds ws.py treats as
+// alerts (_ALERT_EVENT_TYPES); anything else falls back to the raw type.
+const ALERT_TITLES = {
+  CapacityRebalance: "Capacity rebalance",
+  NoAcceptingFacility: "No accepting hospital",
+  AutoRedirect: "Auto-redirect",
+};
 
 function AlertsPanel({ alerts }) {
   const recent = [...alerts].slice(-20).reverse();
@@ -34,15 +43,19 @@ function AlertsPanel({ alerts }) {
                 <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-warning" />
                 <div className="min-w-0 text-xs">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-medium text-warning">{alert.type}</span>
+                    <span className="font-medium text-warning">{ALERT_TITLES[alert.type] ?? alert.type}</span>
                     {alert.transport_id && (
                       <Badge variant="outline" className="border-warning-border font-mono font-normal text-warning">
                         {alert.transport_id}
                       </Badge>
                     )}
                   </div>
-                  <p className="mt-0.5 truncate font-mono text-warning/80" title={JSON.stringify(alert.payload)}>
-                    {JSON.stringify(alert.payload)}
+                  {/* Same treatment as the timeline: a sentence to read, the
+                      raw payload on hover. eventText only needs type+payload
+                      for these three — none of them reads facility_id, which
+                      the alert message doesn't carry. */}
+                  <p className="mt-0.5 text-warning/90" title={JSON.stringify(alert.payload)}>
+                    {eventText(alert)}
                   </p>
                 </div>
               </li>

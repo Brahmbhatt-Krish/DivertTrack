@@ -576,3 +576,19 @@ def test_a_new_hospital_cannot_take_over_a_legacy_facility_id(client: TestClient
     )
     assert response.status_code == 409
     assert "Hospital_A" not in [h["id"] for h in client.get("/hospitals").json()]
+
+
+def test_discharging_a_transport_with_no_occupied_bed_is_409(client: TestClient) -> None:
+    """A merely reserved bed belongs to a handshake still in flight; taking it
+    back is a redirect, not a discharge."""
+    started = client.post(
+        "/transports/batch",
+        json={"patients": [{"id": "P1", "acuity": 2, "condition": "GENERAL", "position": [8.0, 8.0]}]},
+    ).json()["transport_ids"][0]
+    response = client.post(f"/transports/{started}/discharge")
+    assert response.status_code == 409
+    assert "discharge" in response.json()["detail"]
+
+
+def test_discharging_an_unknown_transport_is_404(client: TestClient) -> None:
+    assert client.post("/transports/NOPE/discharge").status_code == 404

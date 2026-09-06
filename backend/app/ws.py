@@ -199,6 +199,13 @@ class Hub:
                 ambulance = self._source.ambulance_view(transport_id)
                 if ambulance is not None:
                     messages.append({"kind": "ambulance", "transport_id": transport_id, **ambulance})
+                else:
+                    # No live ambulance for a transport that just changed: it
+                    # has been discharged and retired. Said explicitly, because
+                    # "nothing to push" is indistinguishable from "unchanged"
+                    # on the client, which left a discharged patient's marker
+                    # sitting on the map forever.
+                    messages.append({"kind": "ambulance", "transport_id": transport_id, "removed": True})
 
         if self._source is not None:
             messages.append({"kind": "in_flight", "messages": self._source.in_flight()})

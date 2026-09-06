@@ -1,6 +1,26 @@
 // Every write action the UI can take. "No component fetches on its own"
 // (see state.js) is about *reading* — these are commands, and Controls.jsx
 // / AmbulancePanel.jsx / FuzzPanel.jsx are the only callers.
+// FastAPI's `detail` is a string for a plain HTTPException but an *object*
+// for the structured ones (a 409 carries {error, reason}). Interpolating that
+// straight into an Error produced the useless "[object Object]" the UI showed.
+const REASON_TEXT = {
+  already_arrived: "This patient has already arrived — they can't be redirected.",
+  not_eligible: "That hospital can't take this patient.",
+};
+
+function errorMessage(detail, path, status) {
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    if (detail.reason) return REASON_TEXT[detail.reason] ?? `Not eligible — ${detail.reason}`;
+    if (detail.error) return REASON_TEXT[detail.error] ?? detail.error;
+    // Pydantic validation errors arrive as a list of {loc, msg, ...}.
+    if (Array.isArray(detail)) return detail.map((d) => d.msg ?? JSON.stringify(d)).join("; ");
+    return JSON.stringify(detail);
+  }
+  return `${path} failed with ${status}`;
+}
+
 async function post(path, body) {
   const response = await fetch(path, {
     method: "POST",
@@ -11,7 +31,7 @@ async function post(path, body) {
     let detail = `${path} failed with ${response.status}`;
     try {
       const body = await response.json();
-      if (body.detail) detail = body.detail;
+      if (body.detail !== undefined) detail = errorMessage(body.detail, path, response.status);
     } catch {
       // response body wasn't JSON — keep the generic message
     }
@@ -26,7 +46,7 @@ async function del(path) {
     let detail = `${path} failed with ${response.status}`;
     try {
       const body = await response.json();
-      if (body.detail) detail = body.detail;
+      if (body.detail !== undefined) detail = errorMessage(body.detail, path, response.status);
     } catch {
       // not JSON — keep the generic message
     }
@@ -63,6 +83,7 @@ export const api = {
   listTransports: () => get("/transports"),
   startBatch: (patients) => post("/transports/batch", { patients }),
   candidates: (transportId) => get(`/transports/${transportId}/candidates`),
+  discharge: (transportId) => post(`/transports/${transportId}/discharge`),
   redirectCapacityAware: (transportId, target) => post(`/transports/${transportId}/redirect`, { target: target ?? null }),
   getPolicy: () => get("/policy"),
   setPolicy: (mode) => post("/policy", { mode }),
